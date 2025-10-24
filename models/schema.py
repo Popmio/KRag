@@ -31,7 +31,7 @@ class Document(StructuredNode):
     doc_type = StringProperty()
     doc_num = StringProperty()
     doc_url = StringProperty()
-    doc_id = IntegerProperty(index=True)
+    doc_id = IntegerProperty(index=True, unique_index=True)
     embedding = ArrayProperty()
 
     contain_title = RelationshipTo('Document', 'contain', model=Container)
