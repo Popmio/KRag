@@ -24,3 +24,6 @@ class ConfigError(Exception):
 
 class AlreadyConfiguredError(Exception):
     pass
+
+class DatabaseNotConfiguredError(Exception):
+    pass

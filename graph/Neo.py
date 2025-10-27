@@ -1,2 +1,0 @@
-from neomodel import db
-

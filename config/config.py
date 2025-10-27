@@ -1,5 +1,4 @@
 from neomodel import config as neomodel_config
-from pydantic import BaseModel
 from s_types import s_errors
 from typing import Any, ClassVar, Optional
 import threading

@@ -34,7 +34,7 @@ def setup_logging(log_level=logging.INFO, log_dir="logs"):
     
     # 为特定模块设置不同的日志文件
     modules_log_config = {
-        # 'backend.server.app.task_manager': os.path.join(log_dir, f"task_manager_{today}.log"),
+        'graph.neo.py': os.path.join(log_dir, f"neo_{today}.log"),
         # 'backend.server.app.router': os.path.join(log_dir, f"router_{today}.log"),
         # 'backend.server.app.accept': os.path.join(log_dir, f"accept_{today}.log"),
         # 'backend.llm': os.path.join(log_dir, f"llm_{today}.log"),
