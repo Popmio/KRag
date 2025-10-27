@@ -1,9 +1,5 @@
 
 
-
-
-
-
 class ProtectedError(Exception):
     def __init__(self, message = "The Value is Protected"):
         self.message = message
@@ -19,3 +15,12 @@ class UnexpectedConfigParam(Exception):
 
     def __str__(self):
         return repr(f'{self.key} is not a valid config parameter,please use function get_available_params to confirm params')
+
+class ConfigError(Exception):
+    def __init__(self, message: str, key: str = None, value=None):
+        self.key = key
+        self.value = value
+        super().__init__(message)
+
+class AlreadyConfiguredError(Exception):
+    pass
