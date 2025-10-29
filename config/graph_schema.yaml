@@ -1,0 +1,180 @@
+version: "1.0.0"
+
+labels:
+  - name: Path
+    properties:
+      - name: category_path_text
+        type: string
+      - name: misc_info
+        type: string
+      - name: category_path_embedding
+        type: vector
+        dimensions: 768
+        similarity: cosine
+    indexes:
+      - type: btree
+        properties: ["category_path_text"]
+
+  - name: Document
+    properties:
+      - name: id
+        type: string
+        unique: true
+      - name: file_name
+        type: string
+      - name: doc_type
+        type: string
+      - name: link
+        type: string
+      - name: doc_code
+        type: string
+      - name: file_name_embedding
+        type: vector
+        dimensions: 768
+        similarity: cosine
+    indexes:
+      - type: btree
+        properties: ["file_name", "doc_type"]
+
+  - name: Title
+    properties:
+      - name: id
+        type: string
+        unique: true
+      - name: document_id
+        type: string
+      - name: title_text
+        type: string
+      - name: title_embedding
+        type: vector
+        dimensions: 768
+        similarity: cosine
+    indexes:
+      - type: btree
+        properties: ["title_text"]
+
+  - name: Clause
+    properties:
+      - name: id
+        type: string
+        unique: true
+      - name: heading
+        type: string
+      - name: summary
+        type: string
+      - name: heading_embedding
+        type: vector
+        dimensions: 768
+        similarity: cosine
+    indexes:
+      - type: btree
+        properties: ["heading"]
+
+  - name: Content
+    properties:
+      - name: content_id
+        type: string
+        unique: true
+      - name: text
+        type: string
+      - name: image_base64
+        type: string
+      - name: multimodal_other
+        type: string
+      - name: text_embedding
+        type: vector
+        dimensions: 768
+        similarity: cosine
+    indexes: []
+
+  - name: Keyword
+    properties:
+      - name: text
+        type: string
+        unique: true
+    indexes: []
+
+  - name: Organization
+    properties:
+      - name: id
+        type: string
+        unique: true
+      - name: name
+        type: string
+    indexes: []
+
+relationships:
+  - type: CONTAINS
+    from: Path
+    to: Document
+    properties:
+      - name: edge_type
+        type: string
+
+  - type: CONTAINS
+    from: Document
+    to: Title
+    properties:
+      - name: edge_type
+        type: string
+
+  - type: CONTAINS
+    from: Title
+    to: Title
+    properties:
+      - name: edge_type
+        type: string
+
+  - type: CONTAINS
+    from: Title
+    to: Clause
+    properties:
+      - name: edge_type
+        type: string
+
+  - type: CONTAINS
+    from: Clause
+    to: Content
+    properties:
+      - name: edge_type
+        type: string
+
+
+  - type: CITES
+    from: Document
+    to: Document
+    properties:
+      - name: target_level
+        type: string
+
+  - type: CITES
+    from: Clause
+    to: Document
+    properties:
+      - name: target_level
+        type: string
+
+  - type: CITES
+    from: Clause
+    to: Clause
+    properties:
+      - name: target_level
+        type: string
+
+  - type: PUBLISHED_BY
+    from: Document
+    to: Organization
+    properties:
+      - name: published_at
+        type: datetime
+
+  - type: HAS_KEYWORD
+    from: Document
+    to: Keyword
+    properties: []
+
+  - type: HAS_KEYWORD
+    from: Clause
+    to: Keyword
+    properties: []
+
