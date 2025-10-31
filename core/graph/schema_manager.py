@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import re
@@ -8,7 +9,7 @@ from pydantic import BaseModel
 import yaml
 
 from .neo4j_client import Neo4jClient
-from common.exceptions import SchemaValidationError
+from common.exceptions import SchemaValidationError, NotFoundInSchemaError
 
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,12 @@ class SchemaManager:
             解析后的 SchemaConfig。
         """
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            if not os.path.exists(path):
+                raise NotFoundInSchemaError(f"NOT FIND Schema on {path}")
+            try:
+                data = yaml.safe_load(f) or {}
+            except yaml.YAMLError as exc:
+                raise SchemaValidationError(exc)
         return SchemaConfig(
             labels=data.get("labels", []) or [],
             relationships=data.get("relationships", []) or [],
