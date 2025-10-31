@@ -20,7 +20,6 @@ from common.models.KGnode import (
     HasKeywordRel,
 )
 
-# Label/relationship -> Pydantic model mapping for validation
 _NODE_MODELS: Dict[str, Type[BaseModel]] = {
     "Path": PathNode,
     "Document": DocumentNode,
@@ -41,13 +40,32 @@ _REL_MODELS: Dict[str, Type[BaseModel]] = {
 
 class NodeManager:
 
+    """
+    节点与关系的 CRUD 统一管理器（基于 Neo4j Cypher）。
+
+    设计要点（重要）：
+    - 单项操作（get_node/merge_node/update_node/delete_node 等）要求 `(label.key)` 为唯一约束，避免返回多行导致的语义不确定。
+    - 批量/按属性变体（…_by_property）不要求唯一性，可能命中大量实体，需谨慎使用并控制范围/批大小。
+    - 并发控制：update_node / update_nodes 使用乐观并发控制（OCC），通过快照比对避免“丢失更新”。
+    - merge_node / merge_nodes 采用“仅填充空字段”的软 Upsert 语义，避免盲目覆盖已有值。
+    - 性能提示：
+      - 高度连接节点在 get_node_with_neighbors 时可能返回大量边，建议使用 rel_types、neighbor_labels、limit 进行裁剪；
+      - include_rel_props=True 会返回关系全部属性，可能放大结果体积；
+      - by_property 变体（如 update_nodes_by_property、create_relationships_by_property）可能触发大范围扫描/更新，请仅在可控范围内使用。
+    """
+
     def __init__(self, client: Neo4jClient) -> None:
+        """
+        初始化节点与关系管理器。
+
+        Args:
+            client: 已连接的 Neo4jClient。
+        """
         self._client = client
         self._unique_key_cache: Dict[str, Dict[str, bool]] = {}
 
     @staticmethod
     def _q(identifier: str) -> str:
-        # Quote identifiers to avoid reserved word clashes; input is validated
         return f"`{identifier}`"
 
     @staticmethod
@@ -80,9 +98,7 @@ class NodeManager:
         except ValidationError as e:
             raise DataValidationError(str(e))
 
-    # -------------------
-    # Uniqueness helpers
-    # -------------------
+
     def _is_unique_key(self, label: str, key: str) -> bool:
         cache_for_label = self._unique_key_cache.setdefault(label, {})
         if key in cache_for_label:
@@ -110,10 +126,29 @@ class NodeManager:
         if not self._is_unique_key(label, key):
             raise KRagError(f"Property '{label}.{key}' is not unique; use multi-item variants (e.g., get_nodes)")
 
-    # -------------------
-    # Node CRUD
-    # -------------------
+
     def merge_node(self, label: str, *, key: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        软 Upsert：仅填充空字段，避免覆盖已有值。
+
+        Args:
+            label: 节点标签（安全标识符）。
+            key: 唯一键属性名（要求存在唯一约束）。
+            properties: 节点属性字典，必须包含主键 `key`。
+
+        Returns:
+            包含 `node`(dict) 与 `applied`(List[str]) 的字典。
+
+        Raises:
+            ValueError: 标识符不合法或缺少主键。
+            DataValidationError: 节点属性经 Pydantic 校验失败。
+            KRagError: 数据库未返回记录等异常。
+
+        Notes:
+            - 并发：基于当前快照的“仅填空”判断，在极端并发下仍可能存在覆盖竞争；
+              建议结合幂等/重试策略。
+            - 请勿在 `properties` 中修改主键值；主键仅用于定位。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         self._ensure_unique_key(label, key)
@@ -139,6 +174,21 @@ class NodeManager:
         return rec
 
     def get_node(self, label: str, key: str, value: Any) -> Optional[Dict[str, Any]]:
+        """
+        按唯一键获取单个节点。
+
+        Args:
+            label: 节点标签（安全标识符）。
+            key: 唯一键属性名（需唯一约束）。
+            value: 唯一键取值（不可为 None）。
+
+        Returns:
+            {"node": dict} 或 None（未找到）。
+
+        Raises:
+            ValueError: 当 value 为 None 或标识符不合法。
+            KRagError: 当键不具备唯一性要求时。
+        """
         if value is None:
             raise ValueError(f"Cannot query node by {key}=None")
         self._validate_identifier(label)
@@ -151,6 +201,22 @@ class NodeManager:
         return self._client.execute_single(cypher, {"val": value}, readonly=True)
 
     def get_nodes(self, label: str, key: str, values: List[Any]) -> List[Dict[str, Any]]:
+        """
+        批量按键获取节点（键可非唯一）。
+
+        Args:
+            label: 节点标签。
+            key: 匹配属性名。
+            values: 属性取值列表（会过滤 None）。
+
+        Returns:
+            列表：[ {"node": dict}, ... ]，已去重。
+
+        Raises:
+            ValueError: values 为空或全为 None，或标识符不合法。
+        Notes:
+            - 请控制 `values` 数量，避免过大 UNWIND 造成内存压力。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         if not isinstance(values, list) or not values:
@@ -178,9 +244,33 @@ class NodeManager:
         limit: Optional[int] = None,
         include_rel_props: bool = True,
     ) -> Optional[Dict[str, Any]]:
+        """
+        获取节点与邻居（支持方向与类型筛选）。
+
+        Args:
+            label: 节点标签（需唯一键）。
+            key: 唯一键属性名。
+            value: 唯一键取值。
+            direction: 邻接方向，'out' | 'in' | 'both'。
+            rel_types: 仅返回这些关系类型；None 表示不限。
+            neighbor_labels: 仅返回这些邻居标签；None 表示不限。
+            limit: 返回的边数量上限（在聚合后切片）。
+            include_rel_props: 是否包含关系属性。
+
+        Returns:
+            {"node": dict, "edges": [ {direction, rel, rprops, node{labels, props}}, ... ]} 或 None。
+
+        Raises:
+            ValueError: 参数不合法（方向/标识符）。
+            KRagError: 唯一性要求不满足。
+
+        Notes:
+            - 高度连接节点可能产生大量结果；请结合 `rel_types`、`neighbor_labels` 与 `limit` 限制范围；
+            - `limit` 在服务端聚合后切片，超大结果仍可能有内存压力；
+            - 将 `include_rel_props=False` 可减小返回体积。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        # enforce unique node key for precise neighborhood retrieval
         self._ensure_unique_key(label, key)
         if direction not in {"out", "in", "both"}:
             raise ValueError("direction must be 'out', 'in', or 'both'")
@@ -191,7 +281,6 @@ class NodeManager:
             for lb in neighbor_labels:
                 self._validate_identifier(lb)
 
-        # Build label filter using explicit label predicates to enable label index usage
         if neighbor_labels:
             label_predicate = " AND (" + " OR ".join([f"m:{self._q(lb)}" for lb in neighbor_labels]) + ")"
         else:
@@ -242,6 +331,23 @@ class NodeManager:
         return rec
 
     def update_node(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        条件更新（OCC，乐观并发控制）。
+
+        Args:
+            label: 节点标签（唯一键）。
+            key: 唯一键属性名。
+            value: 唯一键取值。
+            updates: 待更新字段（禁止包含主键）。
+
+        Returns:
+            {"node": dict}，更新后的节点属性。
+
+        Raises:
+            ValueError: 参数不合法或无可更新字段。
+            DataValidationError: 属性校验失败。
+            KRagError: 未找到节点或并发冲突（快照不匹配）。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         self._ensure_unique_key(label, key)
@@ -249,7 +355,6 @@ class NodeManager:
             raise ValueError(f"Cannot update node by {label}.{key}=None")
         if not isinstance(updates, dict) or not updates:
             raise ValueError("No updates provided")
-        # Do not allow primary key update
         if key in updates:
             updates = {k: v for k, v in updates.items() if k != key}
         if not updates:
@@ -257,7 +362,6 @@ class NodeManager:
         current = self.get_node(label, key, value)
         if not current or not isinstance(current.get("node"), dict):
             raise KRagError(f"Node not found for {label}.{key}={value}")
-        # Validate by merging with current snapshot; use sanitized values for keys being updated only
         merged = {**current["node"], **updates}
         sanitized = self._validate_node_properties(label, merged)
         sanitized_updates = {k: sanitized.get(k) for k in updates.keys() if k != key}
@@ -279,6 +383,21 @@ class NodeManager:
         return rec
 
     def merge_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
+        """
+        批量软 Upsert：语义与 merge_node 一致（仅填充空字段）。
+
+        Args:
+            label: 节点标签（唯一键）。
+            key: 唯一键属性名。
+            items: 每项包含主键与属性的字典。
+
+        Returns:
+            成功 upsert 的条数。
+
+        Raises:
+            DataValidationError: 缺少主键或属性校验失败。
+            KRagError: 数据库未返回计数。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         self._ensure_unique_key(label, key)
@@ -306,12 +425,29 @@ class NodeManager:
         return int(rec["upserted"])
 
     def update_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
+        """
+        批量条件更新（OCC）。
+
+        Args:
+            label: 节点标签（唯一键）。
+            key: 唯一键属性名。
+            items: 每项包含主键与更新字段的字典。
+
+        Returns:
+            成功更新的条数（全部成功），否则抛错。
+
+        Raises:
+            ValueError: 缺少可更新字段。
+            DataValidationError: 属性校验失败。
+            KRagError: 任意条未找到或并发冲突（快照不匹配）。
+        Notes:
+            - 建议控制批大小，避免长事务导致锁竞争。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         if not items:
             return 0
         rows: List[Dict[str, Any]] = []
-        # Validate per item by merging with current props, but only write provided fields
         for it in items:
             if key not in it:
                 raise DataValidationError(f"Primary key '{key}' missing from item")
@@ -344,18 +480,38 @@ class NodeManager:
         return len(res)
 
     def update_nodes_by_property(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> int:
+        """
+        按属性批量更新（非唯一键场景）。
+
+        Args:
+            label: 节点标签。
+            key: 匹配属性名（可非唯一）。
+            value: 匹配值（不可为 None）。
+            updates: 更新字段（不可包含匹配键）。
+
+        Returns:
+            实际更新的节点数量。
+
+        Raises:
+            ValueError: 参数不合法或无可更新字段。
+            DataValidationError: 存在未知字段（不在模型定义中）。
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - 可能命中大量节点，属于“放大写入”；
+            - 无 OCC 保护，适合作业/离线小范围修正；
+            - 建议在上层限制选择性或分批执行。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         if value is None:
             raise ValueError(f"Cannot update nodes by {label}.{key}=None")
         if not isinstance(updates, dict) or not updates:
             raise ValueError("No updates provided")
-        # Do not allow updating the match key
         if key in updates:
             updates = {k: v for k, v in updates.items() if k != key}
         if not updates:
             raise ValueError("No updatable fields provided (match key cannot be updated)")
-        # Validate update keys against model fields
         model = _NODE_MODELS.get(label)
         if model is None:
             raise ValueError(f"Node label '{label}' is not allowed. Supported labels: {list(_NODE_MODELS.keys())}")
@@ -374,6 +530,21 @@ class NodeManager:
         return int(rec.get("updated") or 0)
         
     def delete_node(self, label: str, key: str, value: Any) -> int:
+        """
+        删除单个节点（唯一键）。
+
+        Args:
+            label: 节点标签（唯一键）。
+            key: 唯一键属性名。
+            value: 唯一键取值。
+
+        Returns:
+            实际删除的数量（0 或 1）。
+
+        Raises:
+            ValueError: value 为空或标识符不合法。
+            KRagError: 发现重复节点时拒绝删除。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         self._ensure_unique_key(label, key)
@@ -401,13 +572,27 @@ class NodeManager:
         return 1 if matched == 1 else 0
 
     def delete_nodes(self, label: str, key: str, values: List[Any]) -> int:
+        """
+        批量删除（唯一键）。
+
+        Args:
+            label: 节点标签（唯一键）。
+            key: 唯一键属性名。
+            values: 待删除的唯一键取值列表。
+
+        Returns:
+            实际删除的数量。
+
+        Raises:
+            KRagError: 任意键存在重复节点时拒绝删除。
+        Notes:
+            - 会对输入进行去重与过滤 None。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        # Unique-only path; enforce unique key; refuse duplicates like delete_node
         self._ensure_unique_key(label, key)
         if not isinstance(values, list) or not values:
             return 0
-        # Filter out None and deduplicate while preserving order
         seen: set = set()
         clean_values: List[Any] = []
         for v in values:
@@ -446,11 +631,28 @@ class NodeManager:
         return int(rec.get("deleted_nodes") or 0)
 
     def delete_nodes_by_property(self, label: str, key: str, values: List[Any]) -> int:
+        """
+        按属性批量删除（非唯一键）。
+
+        Args:
+            label: 节点标签。
+            key: 匹配属性名（可非唯一）。
+            values: 匹配值列表（会去重与过滤 None）。
+
+        Returns:
+            实际删除的节点数量。
+
+        Raises:
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - DETACH DELETE 会删除节点及其所有关系，属于破坏性操作；
+            - 可能删除大量节点，务必范围可控并做好备份。
+        """
         self._validate_identifier(label)
         self._validate_identifier(key)
         if not isinstance(values, list) or not values:
             return 0
-        # Filter out None and deduplicate while preserving order
         seen: set = set()
         clean_values: List[Any] = []
         for v in values:
@@ -475,9 +677,6 @@ class NodeManager:
             raise KRagError("Batch delete by property failed; database returned no count")
         return int(rec.get("deleted") or 0)
 
-    # -------------------
-    # Relationship CRUD
-    # -------------------
     def create_relationship(
         self,
         from_label: str,
@@ -489,12 +688,31 @@ class NodeManager:
         to_value: Any,
         properties: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        创建单条关系（端点存在且唯一）。
+
+        Args:
+            from_label: 源端标签（唯一键）。
+            from_key: 源端唯一键名。
+            from_value: 源端唯一键值。
+            rel_type: 关系类型。
+            to_label: 目标端标签（唯一键）。
+            to_key: 目标端唯一键名。
+            to_value: 目标端唯一键值。
+            properties: 关系属性字典（按模型校验）。
+
+        Returns:
+            {"rel": 类型, "rprops": 关系属性}。
+
+        Raises:
+            ValueError/DataValidationError: 标识符或属性校验失败。
+            KRagError: 端点不存在或数据库未返回记录。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        # endpoints must be uniquely addressed and exist
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         rprops = self._validate_rel_properties(rel_type, properties or {})
@@ -523,12 +741,31 @@ class NodeManager:
         to_key: str,
         pairs: List[Dict[str, Any]],
     ) -> int:
+        """
+        批量创建关系（端点唯一且必须存在，原子化）。
+
+        Args:
+            from_label: 源端标签（唯一键）。
+            from_key: 源端唯一键名。
+            rel_type: 关系类型。
+            to_label: 目标端标签（唯一键）。
+            to_key: 目标端唯一键名。
+            pairs: 列表，每项包含 {from_value, to_value, properties}。
+
+        Returns:
+            实际创建的关系条数。
+
+        Raises:
+            DataValidationError: 属性校验失败。
+            KRagError: 任一对端点缺失导致整批不创建。
+        Notes:
+            - 保证“要么全成，要么全不成”。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        # Enforce unique keys on both endpoints
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         if not pairs:
@@ -540,7 +777,6 @@ class NodeManager:
             rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
             rows.append({"fv": fv, "tv": tv, "props": rprops})
 
-        # Atomic: detect missing endpoints and only create when all pairs are valid
         cypher = (
             f"UNWIND $rows AS row "
             f"OPTIONAL MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
@@ -576,6 +812,28 @@ class NodeManager:
         to_key: str,
         pairs: List[Dict[str, Any]],
     ) -> int:
+        """
+        按属性批量创建关系（非唯一，允许部分成功）。
+
+        Args:
+            from_label: 源端标签。
+            from_key: 源端匹配键（可非唯一）。
+            rel_type: 关系类型。
+            to_label: 目标端标签。
+            to_key: 目标端匹配键（可非唯一）。
+            pairs: 列表，每项包含 {from_value, to_value, properties}。
+
+        Returns:
+            创建成功的关系条数。
+
+        Raises:
+            DataValidationError: 属性校验失败。
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - 每对 (from_value, to_value) 可匹配多节点，实际创建数为 A×B（笛卡尔乘积），存在“爆炸”风险；
+            - 建议限制选择性并控制批次规模。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
@@ -589,7 +847,6 @@ class NodeManager:
             tv = p.get("to_value")
             rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
             rows.append({"fv": fv, "tv": tv, "props": rprops})
-        # Partial: create for combinations whose endpoints exist; skip missing without failing whole batch
         cypher = (
             f"UNWIND $rows AS row "
             f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
@@ -614,12 +871,28 @@ class NodeManager:
         to_value: Any,
         properties: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        """
+        合并单条关系（端点唯一）。
+
+        Args:
+            from_label/from_key/from_value: 源端（唯一）。
+            rel_type: 关系类型。
+            to_label/to_key/to_value: 目标端（唯一）。
+            properties: 关系属性。
+
+        Returns:
+            {"rel": 类型, "rprops": 属性}；若端点不存在，返回 None（静默跳过）。
+
+        Raises:
+            ValueError/DataValidationError: 标识符或属性校验失败。
+        Notes:
+            - 不创建端点节点，仅在两端都存在时进行 MERGE。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        # Keys must be unique; do not create endpoints. If either side missing, skip silently.
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         rprops = self._validate_rel_properties(rel_type, properties or {})
@@ -635,7 +908,6 @@ class NodeManager:
             {"fromVal": from_value, "toVal": to_value, "rprops": rprops},
             readonly=False,
         )
-        # If either endpoint missing, subquery returns no row → rec is None. Treat as skipped.
         return rec
 
     def merge_relationships(
@@ -647,12 +919,27 @@ class NodeManager:
         to_key: str,
         pairs: List[Dict[str, Any]],
     ) -> int:
+        """
+        批量合并关系（端点唯一且必须存在）。
+
+        Args:
+            from_label/from_key: 源端（唯一）。
+            rel_type: 关系类型。
+            to_label/to_key: 目标端（唯一）。
+            pairs: 列表，每项 {from_value, to_value, properties}。
+
+        Returns:
+            upsert 的关系数量。
+
+        Raises:
+            DataValidationError: 属性校验失败。
+            KRagError: 数据库未返回计数。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(rel_type)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        # Enforce unique keys on both endpoints
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         if not pairs:
@@ -685,6 +972,25 @@ class NodeManager:
         to_key: str,
         pairs: List[Dict[str, Any]],
     ) -> int:
+        """
+        按属性批量合并关系（非唯一）。
+
+        Args:
+            from_label/from_key: 源端匹配键（可非唯一）。
+            rel_type: 关系类型。
+            to_label/to_key: 目标端匹配键（可非唯一）。
+            pairs: 列表，每项 {from_value, to_value, properties}。
+
+        Returns:
+            upsert 的关系数量。
+
+        Raises:
+            DataValidationError: 属性校验失败。
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - 可能出现 A×B 放大；限制选择性或分批执行。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(rel_type)
@@ -722,12 +1028,27 @@ class NodeManager:
         to_value: Any,
         rel_props: Optional[Dict[str, Any]] = None,
     ) -> int:
+        """
+        删除单条关系（端点唯一）。
+
+        Args:
+            from_label/from_key/from_value: 源端（唯一）。
+            rel_type: 关系类型。
+            to_label/to_key/to_value: 目标端（唯一）。
+            rel_props: 关系属性过滤（全部匹配时删除）。
+
+        Returns:
+            实际删除的数量（0/1+）。
+
+        Raises:
+            DataValidationError: 属性键非字符串。
+            KRagError: 数据库未返回计数。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        # Enforce unique endpoints for precise single delete
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         filters: List[str] = []
@@ -769,17 +1090,33 @@ class NodeManager:
         rel_types: Optional[List[str]] = None,
         rel_props: Optional[Dict[str, Any]] = None,
     ) -> int:
+        """
+        批量删除关系（端点唯一）。
+
+        Args:
+            from_label/from_key: 源端（唯一）。
+            rel_type: 默认关系类型；当 rel_types 为空时使用。
+            to_label/to_key: 目标端（唯一）。
+            pairs: 每项 {from_value, to_value}。
+            rel_types: 多关系类型列表。
+            rel_props: 关系属性过滤。
+
+        Returns:
+            删除的关系数量。
+
+        Raises:
+            DataValidationError: rel_types 为空或属性键非字符串。
+            KRagError: 数据库未返回计数。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(rel_type)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        # Enforce unique keys on both endpoints
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         if not pairs:
             return 0
-        # normalize and validate types list
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
@@ -788,7 +1125,6 @@ class NodeManager:
             types_param = rel_types
         else:
             types_param = [rel_type]
-        # build and validate rows
         rows: List[Dict[str, Any]] = []
         for p in pairs:
             fv = p.get("from_value")
@@ -832,6 +1168,27 @@ class NodeManager:
         rel_types: Optional[List[str]] = None,
         rel_props: Optional[Dict[str, Any]] = None,
     ) -> int:
+        """
+        按属性批量删除关系（非唯一）。
+
+        Args:
+            from_label/from_key: 源端匹配键（可非唯一）。
+            rel_type: 默认关系类型；当 rel_types 为空时使用。
+            to_label/to_key: 目标端匹配键（可非唯一）。
+            pairs: 每项 {from_value, to_value}。
+            rel_types: 多关系类型列表。
+            rel_props: 关系属性过滤。
+
+        Returns:
+            删除的关系数量。
+
+        Raises:
+            DataValidationError: rel_types 为空或属性键非字符串。
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - 可能命中大量关系并删除；务必控制选择性。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(rel_type)
@@ -839,7 +1196,6 @@ class NodeManager:
         self._validate_identifier(to_key)
         if not pairs:
             return 0
-        # normalize and validate types list
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
@@ -848,7 +1204,6 @@ class NodeManager:
             types_param = rel_types
         else:
             types_param = [rel_type]
-        # build and validate rows
         rows: List[Dict[str, Any]] = []
         for p in pairs:
             fv = p.get("from_value")
@@ -891,11 +1246,24 @@ class NodeManager:
         *,
         both_directions: bool = False,
     ) -> int:
+        """
+        删除两节点之间的所有关系（端点唯一）。
+
+        Args:
+            from_label/from_key/from_value: 源端（唯一）。
+            to_label/to_key/to_value: 目标端（唯一）。
+            both_directions: 为 True 时同时删除 b->a。
+
+        Returns:
+            删除的关系数量。
+
+        Raises:
+            KRagError: 数据库未返回计数。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        # unique endpoints
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
         cypher = (
@@ -931,6 +1299,23 @@ class NodeManager:
         *,
         both_directions: bool = False,
     ) -> int:
+        """
+        按属性删除“所有匹配的两端对”之间的所有关系（非唯一）。
+
+        Args:
+            from_label/from_key/from_value: 源端匹配键与值（可非唯一）。
+            to_label/to_key/to_value: 目标端匹配键与值（可非唯一）。
+            both_directions: 为 True 时同时删除 b->a。
+
+        Returns:
+            删除的关系数量。
+
+        Raises:
+            KRagError: 数据库未返回计数。
+
+        Notes:
+            - 匹配可能产出多对节点，删除量可能远超预期；务必严格控制选择性。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
@@ -970,14 +1355,27 @@ class NodeManager:
         rel_types: Optional[List[str]] = None,
         include_rel_props: bool = True,
     ) -> List[Dict[str, Any]]:
+        """
+        获取两端点之间的关系列表（端点唯一）。
+
+        Args:
+            from_label/from_key/from_value: 源端（唯一）。
+            to_label/to_key/to_value: 目标端（唯一）。
+            rel_types: 仅返回这些类型；None 表示不限。
+            include_rel_props: 是否包含关系属性。
+
+        Returns:
+            列表：每项包含 {rel, rprops, from_node, to_node}。
+
+        Raises:
+            DataValidationError: rel_types 为空或类型名不合法。
+        """
         self._validate_identifier(from_label)
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        # enforce endpoints are uniquely addressable
         self._ensure_unique_key(from_label, from_key)
         self._ensure_unique_key(to_label, to_key)
-        # validate types list if provided
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
@@ -1012,7 +1410,17 @@ class NodeManager:
         *,
         include_rel_props: bool = True,
     ) -> List[Dict[str, Any]]:
-        # convenience wrapper to fetch all relationship types between two uniquely-addressed nodes
+        """
+        获取两端点之间的“所有类型”关系（端点唯一）的便捷封装。
+
+        Args:
+            from_label/from_key/from_value: 源端（唯一）。
+            to_label/to_key/to_value: 目标端（唯一）。
+            include_rel_props: 是否包含关系属性。
+
+        Returns:
+            关系列表（同 get_relationships）。
+        """
         return self.get_relationships(
             from_label,
             from_key,

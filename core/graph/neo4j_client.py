@@ -68,7 +68,9 @@ class Neo4jClient:
     def session(self, *, readonly: bool = False) -> Generator[Session, None, None]:
 
         default_access_mode = "READ" if readonly else "WRITE"
-        session = self._driver.session(database=self._config.database, default_access_mode=default_access_mode)  # type: ignore[arg-type]
+        session = self._driver.session(database=self._config.database,
+                                       default_access_mode=default_access_mode,
+                                       fetch_size=self._config.fetch_size)
         try:
             yield session
         finally:
@@ -97,6 +99,11 @@ class Neo4jClient:
             rec = result.single()
             return rec.data() if rec else None
 
+    def __enter__(self) -> "Neo4jClient":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
 class SessionConfig:
     READ = "READ"
