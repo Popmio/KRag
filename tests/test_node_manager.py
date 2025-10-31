@@ -134,6 +134,102 @@ def nm(neo4j_client) -> NodeManager:
 #         nm.delete_node("Document", "id", did)
 
 
+# def test_neighbors_visual(nm: NodeManager):
+#     did = f"doc_{uuid.uuid4().hex[:8]}"
+#     kw = f"kw_{uuid.uuid4().hex[:6]}"
+#
+#     nm.merge_node("Document", key="id", properties={"id": did, "file_name": "vis.pdf", "doc_type": "vis"})
+#     nm.merge_node("Keyword", key="text", properties={"text": kw})
+#     nm.create_relationship("Document", "id", did, "HAS_KEYWORD", "Keyword", "text", kw, {})
+#
+#     res = nm.get_node_with_neighbors(
+#         "Document", "id", did, direction="both", neighbor_labels=["Keyword"], limit=10, include_rel_props=True
+#     )
+#     assert res is not None
+#     # print a compact, human-friendly view (run pytest with -s to see output)
+#     print("NODE:", res.get("node"))
+#     edges = res.get("edges", [])
+#     print("EDGES_COUNT:", len(edges))
+#     for i, e in enumerate(edges):
+#         if i >= 5:
+#             print("...", len(edges) - i, "more edges omitted")
+#             break
+#         nlabels = e.get("node", {}).get("labels", [])
+#         nprops = e.get("node", {}).get("props", {})
+#         print(
+#             f"edge[{i}]: dir={e.get('direction')} rel={e.get('rel')} neighbor_labels={nlabels} neighbor_props_keys={list(nprops.keys())}"
+#         )
+#
+#     # cleanup
+#     nm.delete_relationship("Document", "id", did, "HAS_KEYWORD", "Keyword", "text", kw)
+#     nm.delete_node("Keyword", "text", kw)
+#     nm.delete_node("Document", "id", did)
+
+
+# def test_neighbors_variety(nm: NodeManager):
+#     # Create a document with diverse neighbor labels and relationship types
+#     did = f"doc_{uuid.uuid4().hex[:8]}"
+#     did2 = f"doc_{uuid.uuid4().hex[:8]}"
+#     tid = f"title_{uuid.uuid4().hex[:6]}"
+#     cid = f"clause_{uuid.uuid4().hex[:6]}"
+#     org = f"org_{uuid.uuid4().hex[:6]}"
+#     kw1 = f"kw_{uuid.uuid4().hex[:6]}"
+#     kw2 = f"kw_{uuid.uuid4().hex[:6]}"
+#
+#     # nodes
+#     nm.merge_node("Document", key="id", properties={"id": did, "file_name": "n1.pdf"})
+#     nm.merge_node("Document", key="id", properties={"id": did2, "file_name": "n2.pdf"})
+#     nm.merge_node("Title", key="id", properties={"id": tid, "document_id": did, "title_text": "T"})
+#     nm.merge_node("Clause", key="id", properties={"id": cid, "summary": "S"})
+#     nm.merge_node("Organization", key="id", properties={"id": org, "name": "Org"})
+#     nm.merge_node("Keyword", key="text", properties={"text": kw1})
+#     nm.merge_node("Keyword", key="text", properties={"text": kw2})
+#
+#     # outbound from D
+#     nm.create_relationship("Document", "id", did, "HAS_KEYWORD", "Keyword", "text", kw1, {})
+#     nm.create_relationship("Document", "id", did, "HAS_KEYWORD", "Keyword", "text", kw2, {})
+#     nm.create_relationship("Document", "id", did, "PUBLISHED_BY", "Organization", "id", org, {"published_at": "2024-01-01"})
+#     nm.create_relationship("Document", "id", did, "CONTAINS", "Title", "id", tid, {"edge_type": "heading"})
+#     nm.create_relationship("Document", "id", did, "CITES", "Document", "id", did2, {"target_level": "doc"})
+#
+#     # inbound to D
+#     nm.create_relationship("Clause", "id", cid, "CITES", "Document", "id", did, {"target_level": "doc"})
+#     nm.create_relationship("Document", "id", did2, "CITES", "Document", "id", did, {"target_level": "doc"})
+#
+#     # query
+#     result = nm.get_node_with_neighbors("Document", "id", did, direction="both", limit=100, include_rel_props=True)
+#     assert result is not None
+#     edges = result.get("edges", [])
+#     print("VARIETY_EDGES_COUNT:", len(edges))
+#
+#     # group by (direction, rel, neighbor label)
+#     summary = {}
+#     for e in edges:
+#         labels = e.get("node", {}).get("labels", [])
+#         top_label = labels[0] if labels else "_unknown"
+#         key = (e.get("direction"), e.get("rel"), top_label)
+#         summary[key] = summary.get(key, 0) + 1
+#     for (d, r, l), c in sorted(summary.items()):
+#         print(f"dir={d} rel={r} neighbor_label={l} count={c}")
+#
+#     # filtered views
+#     out_only = nm.get_node_with_neighbors("Document", "id", did, direction="out", rel_types=["HAS_KEYWORD", "PUBLISHED_BY"], limit=50)
+#     assert out_only is not None and len(out_only.get("edges", [])) >= 2
+#     print("FILTERED_OUT_EDGES:", len(out_only.get("edges", [])))
+#
+#     in_only = nm.get_node_with_neighbors("Document", "id", did, direction="in", rel_types=["CITES"], limit=50)
+#     assert in_only is not None and len(in_only.get("edges", [])) >= 1
+#     print("FILTERED_IN_CITES_EDGES:", len(in_only.get("edges", [])))
+#
+#     # cleanup
+#     nm.delete_node("Title", "id", tid)
+#     nm.delete_node("Clause", "id", cid)
+#     nm.delete_node("Organization", "id", org)
+#     nm.delete_node("Keyword", "text", kw1)
+#     nm.delete_node("Keyword", "text", kw2)
+#     nm.delete_node("Document", "id", did2)
+#     nm.delete_node("Document", "id", did)
+
 # def test_unique_and_input_validation(nm: NodeManager):
 #     # get_node: None value
 #     with pytest.raises(ValueError):
