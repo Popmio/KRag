@@ -119,4 +119,24 @@
 3) 健康检查：`GET /healthz`、`GET /v1/ping`
 4) 配置更新：修改 `config/*.yaml` 后，确保索引维度/相似度与 `vector_index_manager.py` 使用一致。
 
+## 图谱基础管理 Quickstart
+- 配置 Neo4j 连接：在环境变量中设置 `NEO4J_URI/USERNAME/PASSWORD/DATABASE`（参考 `.env.example`）。
+- 应用 Schema：
+  ```python
+  from core.graph.neo4j_client import Neo4jClient, Neo4jConfig
+  from core.graph.schema_manager import SchemaManager
+
+  client = Neo4jClient(Neo4jConfig(uri="bolt://localhost:7687", username="neo4j", password="***"))
+  sm = SchemaManager(client)
+  cfg = sm.load_yaml("config/graph_schema.yaml")
+  sm.apply(cfg)
+  ```
+- 基础写入/关系：
+  ```python
+  from core.graph.node_manager import NodeManager
+  nm = NodeManager(client)
+  nm.merge_node("Document", key="id", properties={"id": "doc_1", "title": "hello"})
+  nm.merge_relationship("Document", "id", "doc_1", "MENTIONS", "Entity", "id", "ent_1", {"weight": 0.9})
+  ```
+
 
