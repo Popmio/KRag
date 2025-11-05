@@ -16,24 +16,125 @@ from .embedding.api_embedder import APIEmbedder, OpenAIEmbedder, CohereEmbedder,
 logger = logging.getLogger(__name__)
 
 
+def _find_project_root(config_file: str = "config/models.yaml") -> Path:
+    """
+    查找项目根目录（包含config/models.yaml的目录）
+    
+    查找策略：
+    1. 检查环境变量 MODEL_CONFIG_PATH，如果设置了且文件存在，使用其所在目录
+    2. 如果config_file是绝对路径且文件存在，直接使用
+    3. 从当前文件位置开始向上查找，直到找到包含config/models.yaml的目录
+    4. 如果找不到，返回当前工作目录
+    
+    Args:
+        config_file: 配置文件名（相对于项目根目录）
+        
+    Returns:
+        项目根目录的Path对象
+    """
+    config_path = Path(config_file)
+    
+    # 1. 检查环境变量
+    env_config_path = os.environ.get("MODEL_CONFIG_PATH")
+    if env_config_path:
+        env_path = Path(env_config_path)
+        if env_path.exists():
+            # 如果环境变量指向的是文件，返回其父目录
+            if env_path.is_file():
+                return env_path.parent
+            # 如果是目录，检查其下是否有config/models.yaml
+            config_in_env = env_path / config_file
+            if config_in_env.exists():
+                return env_path
+    
+    # 2. 如果是绝对路径且文件存在，直接使用其父目录
+    if config_path.is_absolute() and config_path.exists():
+        return config_path.parent
+    
+    # 3. 从当前文件位置开始向上查找项目根目录
+    # 获取当前文件（model_registry.py）的目录
+    current_file = Path(__file__).resolve()
+    current_dir = current_file.parent
+    
+    # 向上查找，直到找到包含config/models.yaml的目录
+    search_dir = current_dir
+    while search_dir != search_dir.parent:  # 直到根目录
+        config_file_path = search_dir / config_file
+        if config_file_path.exists():
+            return search_dir
+        search_dir = search_dir.parent
+    
+    # 4. 如果找不到，尝试从当前工作目录查找
+    cwd = Path.cwd()
+    config_file_path = cwd / config_file
+    if config_file_path.exists():
+        return cwd
+    
+    # 5. 最后返回当前文件所在目录（向后兼容）
+    logger.warning(f"未找到项目根目录，使用当前文件所在目录: {current_dir}")
+    return current_dir
+
+
 class ModelRegistry:
     """模型注册器"""
     
-    def __init__(self, config_path: str = "config/models.yaml"):
-        self.config_path = Path(config_path)
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        初始化模型注册器
+        
+        Args:
+            config_path: 配置文件路径。如果为None，则：
+                1. 优先使用环境变量 MODEL_CONFIG_PATH
+                2. 否则自动查找项目根目录下的 config/models.yaml
+                如果为相对路径，则相对于自动找到的项目根目录
+                如果为绝对路径，则直接使用
+        """
+        if config_path is None:
+            # 检查环境变量
+            env_config_path = os.environ.get("MODEL_CONFIG_PATH")
+            if env_config_path:
+                self.config_path = Path(env_config_path)
+                # 从配置文件路径推导项目根目录
+                if self.config_path.is_file():
+                    self.project_root = self.config_path.parent.parent  # config/models.yaml -> 项目根目录
+                else:
+                    self.project_root = self.config_path.parent
+            else:
+                # 自动查找项目根目录
+                self.project_root = _find_project_root()
+                self.config_path = self.project_root / "config/models.yaml"
+        else:
+            config_path_obj = Path(config_path)
+            if config_path_obj.is_absolute():
+                # 绝对路径直接使用
+                self.config_path = config_path_obj
+                # 从配置文件路径推导项目根目录
+                if self.config_path.name == "models.yaml" and self.config_path.parent.name == "config":
+                    self.project_root = self.config_path.parent.parent
+                else:
+                    self.project_root = _find_project_root()
+            else:
+                # 相对路径，相对于项目根目录
+                self.project_root = _find_project_root()
+                self.config_path = self.project_root / config_path
+        
         self.config = self._load_config()
         self._embedders: Dict[str, BaseEmbedder] = {}
         self._rerankers: Dict[str, BaseReranker] = {}
         self._llms: Dict[str, BaseLLM] = {}
         
-   # ... existing code ...
     def _load_config(self) -> Dict[str, Any]:
         """加载模型配置"""
         try:
+            if not self.config_path.exists():
+                logger.warning(f"配置文件不存在: {self.config_path}，使用空配置")
+                return {}
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f) or {}
+                config = yaml.safe_load(f) or {}
+                logger.info(f"成功加载配置文件: {self.config_path}")
+                return config
         except Exception as e:
-            logger.error(f"加载模型配置失败: {e}")
+            logger.error(f"加载模型配置失败: {e}，配置文件路径: {self.config_path}")
             return {}
 # ... existing code ...
 
@@ -90,6 +191,12 @@ class ModelRegistry:
             model_config = self._get_model_config("embedding", provider, model_name)
             # 生成基础配置 - 优先使用模型级别的cache_dir
             cache_dir = model_config.get("cache_dir") or model_config.get("modelpath") or self._get_cache_dir()
+            
+            # 确保 cache_dir 是绝对路径（相对于项目根目录）
+            cache_dir_path = Path(cache_dir)
+            if not cache_dir_path.is_absolute():
+                cache_dir = str((self.project_root / cache_dir_path).resolve())
+            
             config = ModelConfig(
                 name=model_name,
                 description=model_config.get("description"),
@@ -254,12 +361,23 @@ class ModelRegistry:
         return device_config.get("preferred", "cuda")
     
     def _get_cache_dir(self) -> str:
-        """获取缓存目录"""
+        """
+        获取缓存目录（相对于项目根目录的绝对路径）
+        
+        如果配置中的 cache_dir 是相对路径，则转换为相对于项目根目录的绝对路径
+        如果是绝对路径，则直接使用
+        """
         loading_config = self.config.get("loading", {})
         cache_config = loading_config.get("cache", {})
         cache_dir = cache_config.get("cache_dir", "models/cache")
-        # 确保路径使用正确的分隔符
-        return str(Path(cache_dir))
+        
+        cache_dir_path = Path(cache_dir)
+        if cache_dir_path.is_absolute():
+            # 已经是绝对路径，直接使用
+            return str(cache_dir_path)
+        else:
+            # 相对路径，转换为相对于项目根目录的绝对路径
+            return str((self.project_root / cache_dir_path).resolve())
     
     def preload_models(self) -> None:
         """预加载模型"""
