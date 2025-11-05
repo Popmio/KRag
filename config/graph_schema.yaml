@@ -9,7 +9,7 @@ labels:
         type: string
       - name: category_path_embedding
         type: vector
-        dimensions: 768
+        dimensions: 1024
         similarity: cosine
     indexes:
       - type: btree
@@ -30,7 +30,7 @@ labels:
         type: string
       - name: file_name_embedding
         type: vector
-        dimensions: 768
+        dimensions: 1024
         similarity: cosine
     indexes:
       - type: btree
@@ -47,7 +47,7 @@ labels:
         type: string
       - name: title_embedding
         type: vector
-        dimensions: 768
+        dimensions: 1024
         similarity: cosine
     indexes:
       - type: btree
@@ -64,7 +64,7 @@ labels:
         type: string
       - name: heading_embedding
         type: vector
-        dimensions: 768
+        dimensions: 1024
         similarity: cosine
     indexes:
       - type: btree
@@ -83,7 +83,7 @@ labels:
         type: string
       - name: text_embedding
         type: vector
-        dimensions: 768
+        dimensions: 1024
         similarity: cosine
     indexes: []
 
@@ -146,6 +146,8 @@ relationships:
     properties:
       - name: target_level
         type: string
+      - name: note
+        type: string
 
   - type: CITES
     from: Clause
@@ -153,12 +155,16 @@ relationships:
     properties:
       - name: target_level
         type: string
+      - name: note
+        type: string
 
   - type: CITES
     from: Clause
     to: Clause
     properties:
       - name: target_level
+        type: string
+      - name: note
         type: string
 
   - type: PUBLISHED_BY

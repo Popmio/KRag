@@ -36,7 +36,12 @@ class Neo4jClient:
             connection_acquisition_timeout=config.connection_acquisition_timeout,
         )
 
-        self.verify_connectivity()
+        try:
+            self.verify_connectivity()
+        except Exception:
+            # 如果连接失败，确保关闭 driver 以避免资源泄漏
+            self.close()
+            raise
 
     def close(self) -> None:
         try:

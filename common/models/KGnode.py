@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 from common.utils.embedding_utils import validate_vector_dimension
 
 
-EMBED_DIM = 768
+EMBED_DIM = 1024
 
 
 class PathNode(BaseModel):
@@ -109,6 +109,7 @@ class PublishedByRel(BaseModel):
 class CitesRel(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target_level: Optional[str] = None
+    note: Optional[str] = None  # 可选的备注字段
 
 
 class HasKeywordRel(BaseModel):

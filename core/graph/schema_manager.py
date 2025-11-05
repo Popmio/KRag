@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import re
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import yaml
 
 from .neo4j_client import Neo4jClient
@@ -15,10 +14,10 @@ from common.exceptions import SchemaValidationError, NotFoundInSchemaError
 logger = logging.getLogger(__name__)
 
 
-@dataclass
 class SchemaConfig(BaseModel):
-    labels: List[Dict[str, Any]]
-    relationships: List[Dict[str, Any]]
+    """Schema 配置模型"""
+    labels: List[Dict[str, Any]] = Field(default_factory=list)
+    relationships: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SchemaManager:
@@ -66,13 +65,17 @@ class SchemaManager:
         Returns:
             解析后的 SchemaConfig。
         """
-        with open(path, "r", encoding="utf-8") as f:
-            if not os.path.exists(path):
-                raise NotFoundInSchemaError(f"NOT FIND Schema on {path}")
-            try:
+        if not os.path.exists(path):
+            raise NotFoundInSchemaError(f"NOT FIND Schema on {path}")
+        
+        try:
+            with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-            except yaml.YAMLError as exc:
-                raise SchemaValidationError(exc)
+        except yaml.YAMLError as exc:
+            raise SchemaValidationError(f"YAML parsing error: {exc}")
+        except Exception as exc:
+            raise SchemaValidationError(f"Failed to load schema file: {exc}")
+        
         return SchemaConfig(
             labels=data.get("labels", []) or [],
             relationships=data.get("relationships", []) or [],
