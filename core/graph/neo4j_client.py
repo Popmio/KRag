@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, AsyncGenerator
 
-from neo4j import GraphDatabase, Driver, Session, basic_auth
+from neo4j import AsyncGraphDatabase, basic_auth
 from neo4j.exceptions import ServiceUnavailable, AuthError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -29,30 +29,23 @@ class Neo4jClient:
 
     def __init__(self, config: Neo4jConfig) -> None:
         self._config = config
-        self._driver: Driver = GraphDatabase.driver(
+        self._driver = AsyncGraphDatabase.driver(
             config.uri,
             auth=basic_auth(config.username, config.password),
             max_connection_pool_size=config.max_connection_pool_size,
             connection_acquisition_timeout=config.connection_acquisition_timeout,
         )
 
+    async def close(self) -> None:
         try:
-            self.verify_connectivity()
-        except Exception:
-            # 如果连接失败，确保关闭 driver 以避免资源泄漏
-            self.close()
-            raise
-
-    def close(self) -> None:
-        try:
-            self._driver.close()
+            await self._driver.close()
         except Exception:
             logger.exception("Error closing Neo4j driver")
 
-    def verify_connectivity(self) -> None:
+    async def verify_connectivity(self) -> None:
         try:
-            self._driver.verify_connectivity()
-            logger.info("Connected to Neo4j at %s (db=%s)", self._config.uri, self._config.database)
+            await self._driver.verify_connectivity()
+            logger.info("Connected to Neo4j (async) at %s (db=%s)", self._config.uri, self._config.database)
         except AuthError as exc:
             logger.error("Neo4j authentication failed: %s", exc)
             raise
@@ -60,26 +53,27 @@ class Neo4jClient:
             logger.error("Neo4j service unavailable: %s", exc)
             raise
 
-    def ping(self) -> bool:
+    async def ping(self) -> bool:
         try:
-            with self.session(readonly=True) as session:
-                result = session.run("RETURN 1 AS ok")
-                record = result.single()
-                return bool(record and record[0] == 1)
+            async with self.session(readonly=True) as session:
+                result = await session.run("RETURN 1 AS ok")
+                rec = await result.single()
+                return bool(rec and rec[0] == 1)
         except Exception:
             return False
 
-    @contextmanager
-    def session(self, *, readonly: bool = False) -> Generator[Session, None, None]:
-
+    @asynccontextmanager
+    async def session(self, *, readonly: bool = False) -> AsyncGenerator[Any, None]:
         default_access_mode = "READ" if readonly else "WRITE"
-        session = self._driver.session(database=self._config.database,
-                                       default_access_mode=default_access_mode,
-                                       fetch_size=self._config.fetch_size)
+        session = self._driver.session(
+            database=self._config.database,
+            default_access_mode=default_access_mode,
+            fetch_size=self._config.fetch_size,
+        )
         try:
             yield session
         finally:
-            session.close()
+            await session.close()
 
     @retry(
         reraise=True,
@@ -87,10 +81,10 @@ class Neo4jClient:
         wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
         retry=retry_if_exception_type(ServiceUnavailable),
     )
-    def execute(self, cypher: str, params: Optional[Dict[str, Any]] = None, *, readonly: bool = False) -> Iterable[Dict[str, Any]]:
-        with self.session(readonly=readonly) as session:
-            result = session.run(cypher, parameters=params or {})
-            return result.data()
+    async def execute(self, cypher: str, params: Optional[Dict[str, Any]] = None, *, readonly: bool = False) -> Iterable[Dict[str, Any]]:
+        async with self.session(readonly=readonly) as session:
+            result = await session.run(cypher, parameters=params or {})
+            return await result.data()
 
     @retry(
         reraise=True,
@@ -98,17 +92,18 @@ class Neo4jClient:
         wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
         retry=retry_if_exception_type(ServiceUnavailable),
     )
-    def execute_single(self, cypher: str, params: Optional[Dict[str, Any]] = None, *, readonly: bool = False) -> Optional[Dict[str, Any]]:
-        with self.session(readonly=readonly) as session:
-            result = session.run(cypher, parameters=params or {})
-            rec = result.single()
+    async def execute_single(self, cypher: str, params: Optional[Dict[str, Any]] = None, *, readonly: bool = False) -> Optional[Dict[str, Any]]:
+        async with self.session(readonly=readonly) as session:
+            result = await session.run(cypher, parameters=params or {})
+            rec = await result.single()
             return rec.data() if rec else None
 
-    def __enter__(self) -> "Neo4jClient":
+    async def __aenter__(self) -> "Neo4jClient":
+        await self.verify_connectivity()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
 
 class SessionConfig:
     READ = "READ"

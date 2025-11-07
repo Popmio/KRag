@@ -99,11 +99,11 @@ class NodeManager:
             raise DataValidationError(str(e))
 
 
-    def _is_unique_key(self, label: str, key: str) -> bool:
+    async def _is_unique_key(self, label: str, key: str) -> bool:
         cache_for_label = self._unique_key_cache.setdefault(label, {})
         if key in cache_for_label:
             return cache_for_label[key]
-        rows = self._client.execute(
+        rows = await self._client.execute(
             (
                 "SHOW CONSTRAINTS YIELD type, entityType, labelsOrTypes, properties "
                 "WHERE entityType = 'NODE' "
@@ -122,12 +122,12 @@ class NodeManager:
         cache_for_label[key] = is_unique
         return is_unique
 
-    def _ensure_unique_key(self, label: str, key: str) -> None:
-        if not self._is_unique_key(label, key):
+    async def _ensure_unique_key(self, label: str, key: str) -> None:
+        if not await self._is_unique_key(label, key):
             raise KRagError(f"Property '{label}.{key}' is not unique; use multi-item variants (e.g., get_nodes)")
 
 
-    def merge_node(self, label: str, *, key: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+    async def merge_node(self, label: str, *, key: str, properties: Dict[str, Any]) -> Dict[str, Any]:
         """
         软 Upsert：仅填充空字段，避免覆盖已有值。
 
@@ -151,7 +151,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         if key not in properties:
             raise DataValidationError(f"Primary key '{key}' missing from node properties")
         props = self._validate_node_properties(label, properties)
@@ -164,7 +164,7 @@ class NodeManager:
             "FOREACH (k IN toSet | SET n[k] = props[k]) "
             "RETURN properties(n) AS node, toSet AS applied"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {"keyVal": props[key], "propsNoKey": props_no_key},
             readonly=False,
@@ -173,7 +173,7 @@ class NodeManager:
             raise KRagError("Failed to merge node; no record returned from database")
         return rec
 
-    def get_node(self, label: str, key: str, value: Any) -> Optional[Dict[str, Any]]:
+    async def get_node(self, label: str, key: str, value: Any) -> Optional[Dict[str, Any]]:
         """
         按唯一键获取单个节点。
 
@@ -193,14 +193,14 @@ class NodeManager:
             raise ValueError(f"Cannot query node by {key}=None")
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         cypher = (
             f"MATCH (n:{self._q(label)} {{{self._q(key)}: $val}}) "
             f"RETURN properties(n) AS node LIMIT 1"
         )
-        return self._client.execute_single(cypher, {"val": value}, readonly=True)
+        return await self._client.execute_single(cypher, {"val": value}, readonly=True)
 
-    def get_nodes(self, label: str, key: str, values: List[Any]) -> List[Dict[str, Any]]:
+    async def get_nodes(self, label: str, key: str, values: List[Any]) -> List[Dict[str, Any]]:
         """
         批量按键获取节点（键可非唯一）。
 
@@ -229,10 +229,10 @@ class NodeManager:
             f"MATCH (n:{self._q(label)} {{{self._q(key)}: v}}) "
             f"RETURN DISTINCT properties(n) AS node"
         )
-        rows = self._client.execute(cypher, {"vals": values}, readonly=True)
+        rows = await self._client.execute(cypher, {"vals": values}, readonly=True)
         return list(rows)
 
-    def get_node_with_neighbors(
+    async def get_node_with_neighbors(
         self,
         label: str,
         key: str,
@@ -271,7 +271,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         if direction not in {"out", "in", "both"}:
             raise ValueError("direction must be 'out', 'in', or 'both'")
         if rel_types is not None:
@@ -316,7 +316,7 @@ class NodeManager:
             RETURN node, CASE WHEN $limit IS NULL THEN edges ELSE edges[0..$limit] END AS edges
             """
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {
                 "val": value,
@@ -330,7 +330,7 @@ class NodeManager:
         )
         return rec
 
-    def update_node(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def update_node(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         条件更新（OCC，乐观并发控制）。
 
@@ -350,7 +350,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         if value is None:
             raise ValueError(f"Cannot update node by {label}.{key}=None")
         if not isinstance(updates, dict) or not updates:
@@ -359,7 +359,7 @@ class NodeManager:
             updates = {k: v for k, v in updates.items() if k != key}
         if not updates:
             raise ValueError("No updatable fields provided (primary key cannot be updated)")
-        current = self.get_node(label, key, value)
+        current = await self.get_node(label, key, value)
         if not current or not isinstance(current.get("node"), dict):
             raise KRagError(f"Node not found for {label}.{key}={value}")
         merged = {**current["node"], **updates}
@@ -375,14 +375,14 @@ class NodeManager:
             f"RETURN properties(n) AS node"
         )
         params = {"val": value, "updates": sanitized_updates, "expected": expected_snapshot, "sentinel": sentinel}
-        rec = self._client.execute_single(cypher, params, readonly=False)
+        rec = await self._client.execute_single(cypher, params, readonly=False)
         if not rec or not isinstance(rec.get("node"), dict):
             raise KRagError(
                 f"Failed to update node {label}.{key}={value}; node may not exist or fields changed concurrently"
             )
         return rec
 
-    def merge_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
+    async def merge_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
         """
         批量软 Upsert：语义与 merge_node 一致（仅填充空字段）。
 
@@ -400,7 +400,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         rows: List[Dict[str, Any]] = []
         for it in items or []:
             if key not in it:
@@ -419,12 +419,12 @@ class NodeManager:
             f"FOREACH (k IN toSet | SET n[k] = props[k]) "
             f"RETURN count(*) AS upserted"
         )
-        rec = self._client.execute_single(cypher, {"rows": rows}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"rows": rows}, readonly=False)
         if not rec or not isinstance(rec.get("upserted"), int):
             raise KRagError("Batch merge failed; database returned no count")
         return int(rec["upserted"])
 
-    def update_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
+    async def update_nodes(self, label: str, *, key: str, items: List[Dict[str, Any]]) -> int:
         """
         批量条件更新（OCC）。
 
@@ -452,8 +452,8 @@ class NodeManager:
             if key not in it:
                 raise DataValidationError(f"Primary key '{key}' missing from item")
             k = it[key]
-            self._ensure_unique_key(label, key)
-            current = self.get_node(label, key, k)
+            await self._ensure_unique_key(label, key)
+            current = await self.get_node(label, key, k)
             if not current or not isinstance(current.get("node"), dict):
                 raise KRagError(f"Node not found for {label}.{key}={k}")
             updates_only = {kk: vv for kk, vv in it.items() if kk != key}
@@ -472,14 +472,15 @@ class NodeManager:
             f"SET n += row.updates "
             f"RETURN 1 AS updated"
         )
-        res = list(self._client.execute(cypher, {"rows": rows, "sentinel": "__KRAG__NULL__SENTINEL__"}, readonly=False))
+        rows_result = await self._client.execute(cypher, {"rows": rows, "sentinel": "__KRAG__NULL__SENTINEL__"}, readonly=False)
+        res = list(rows_result)
         if len(res) != len(rows):
             raise KRagError(
                 f"Updated {len(res)}/{len(rows)} nodes; some may not exist or were deleted concurrently"
             )
         return len(res)
 
-    def update_nodes_by_property(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> int:
+    async def update_nodes_by_property(self, label: str, key: str, value: Any, updates: Dict[str, Any]) -> int:
         """
         按属性批量更新（非唯一键场景）。
 
@@ -524,12 +525,12 @@ class NodeManager:
             f"SET n += $updates "
             f"RETURN count(n) AS updated"
         )
-        rec = self._client.execute_single(cypher, {"val": value, "updates": updates}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"val": value, "updates": updates}, readonly=False)
         if not rec or not isinstance(rec.get("updated"), int):
             raise KRagError("Update by property failed; database returned no count")
         return int(rec.get("updated") or 0)
         
-    def delete_node(self, label: str, key: str, value: Any) -> int:
+    async def delete_node(self, label: str, key: str, value: Any) -> int:
         """
         删除单个节点（唯一键）。
 
@@ -547,7 +548,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         if value is None:
             raise ValueError(f"Cannot delete node by {label}.{key}=None")
         cypher = (
@@ -561,7 +562,7 @@ class NodeManager:
             f"}} "
             f"RETURN cnt AS matched"
         )
-        rec = self._client.execute_single(cypher, {"val": value}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"val": value}, readonly=False)
         if not rec or not isinstance(rec.get("matched"), int):
             raise KRagError("Delete failed; database returned no match count")
         matched = int(rec.get("matched") or 0)
@@ -571,7 +572,7 @@ class NodeManager:
             )
         return 1 if matched == 1 else 0
 
-    def delete_nodes(self, label: str, key: str, values: List[Any]) -> int:
+    async def delete_nodes(self, label: str, key: str, values: List[Any]) -> int:
         """
         批量删除（唯一键）。
 
@@ -590,7 +591,7 @@ class NodeManager:
         """
         self._validate_identifier(label)
         self._validate_identifier(key)
-        self._ensure_unique_key(label, key)
+        await self._ensure_unique_key(label, key)
         if not isinstance(values, list) or not values:
             return 0
         seen: set = set()
@@ -620,7 +621,7 @@ class NodeManager:
             f"}} "
             f"RETURN dup_count AS dup_count, coalesce(deleted_nodes, 0) AS deleted_nodes"
         )
-        rec = self._client.execute_single(cypher, {"vals": clean_values}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"vals": clean_values}, readonly=False)
         if not rec:
             raise KRagError("Batch delete failed; no result returned")
         dup_count = int(rec.get("dup_count") or 0)
@@ -630,7 +631,7 @@ class NodeManager:
             )
         return int(rec.get("deleted_nodes") or 0)
 
-    def delete_nodes_by_property(self, label: str, key: str, values: List[Any]) -> int:
+    async def delete_nodes_by_property(self, label: str, key: str, values: List[Any]) -> int:
         """
         按属性批量删除（非唯一键）。
 
@@ -672,12 +673,12 @@ class NodeManager:
             f"DETACH DELETE n "
             f"RETURN count(*) AS deleted"
         )
-        rec = self._client.execute_single(cypher, {"vals": clean_values}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"vals": clean_values}, readonly=False)
         if not rec or not isinstance(rec.get("deleted"), int):
             raise KRagError("Batch delete by property failed; database returned no count")
         return int(rec.get("deleted") or 0)
 
-    def create_relationship(
+    async def create_relationship(
         self,
         from_label: str,
         from_key: str,
@@ -713,8 +714,8 @@ class NodeManager:
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         rprops = self._validate_rel_properties(rel_type, properties or {})
         cypher = (
             f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}) "
@@ -723,7 +724,7 @@ class NodeManager:
             f"SET r += $rprops "
             f"RETURN type(r) AS rel, properties(r) AS rprops"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {"fromVal": from_value, "toVal": to_value, "rprops": rprops},
             readonly=False,
@@ -732,7 +733,7 @@ class NodeManager:
             raise KRagError("Failed to create relationship; ensure both nodes exist")
         return rec
 
-    def create_relationships(
+    async def create_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -766,8 +767,8 @@ class NodeManager:
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         if not pairs:
             return 0
         rows: List[Dict[str, Any]] = []
@@ -794,7 +795,7 @@ class NodeManager:
             f"}} "
             f"RETURN missing AS missing, coalesce(created_inner, 0) AS created"
         )
-        rec = self._client.execute_single(cypher, {"rows": rows}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"rows": rows}, readonly=False)
         if not rec:
             raise KRagError("Batch create relationships failed; no result returned")
         missing = int(rec.get("missing") or 0)
@@ -803,7 +804,7 @@ class NodeManager:
         created = int(rec.get("created") or 0)
         return created
 
-    def create_relationships_by_property(
+    async def create_relationships_by_property(
         self,
         from_label: str,
         from_key: str,
@@ -855,12 +856,12 @@ class NodeManager:
             f"SET rel += row.props "
             f"RETURN count(rel) AS created"
         )
-        rec = self._client.execute_single(cypher, {"rows": rows}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"rows": rows}, readonly=False)
         if not rec or not isinstance(rec.get("created"), int):
             raise KRagError("Batch create relationships by property failed; no count")
         return int(rec.get("created") or 0)
 
-    def merge_relationship(
+    async def merge_relationship(
         self,
         from_label: str,
         from_key: str,
@@ -893,8 +894,8 @@ class NodeManager:
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         rprops = self._validate_rel_properties(rel_type, properties or {})
         cypher = (
             f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}) "
@@ -903,14 +904,14 @@ class NodeManager:
             f"SET r += $rprops "
             f"RETURN type(r) AS rel, properties(r) AS rprops"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {"fromVal": from_value, "toVal": to_value, "rprops": rprops},
             readonly=False,
         )
         return rec
 
-    def merge_relationships(
+    async def merge_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -940,8 +941,8 @@ class NodeManager:
         self._validate_identifier(rel_type)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         if not pairs:
             return 0
         rows: List[Dict[str, Any]] = []
@@ -958,12 +959,12 @@ class NodeManager:
             f"SET r += row.props "
             f"RETURN count(*) AS upserted"
         )
-        rec = self._client.execute_single(cypher, {"rows": rows}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"rows": rows}, readonly=False)
         if not rec or not isinstance(rec.get("upserted"), int):
             raise KRagError("Batch merge relationships failed; no count")
         return int(rec.get("upserted") or 0)
 
-    def merge_relationships_by_property(
+    async def merge_relationships_by_property(
         self,
         from_label: str,
         from_key: str,
@@ -1012,12 +1013,12 @@ class NodeManager:
             f"SET r += row.props "
             f"RETURN count(*) AS upserted"
         )
-        rec = self._client.execute_single(cypher, {"rows": rows}, readonly=False)
+        rec = await self._client.execute_single(cypher, {"rows": rows}, readonly=False)
         if not rec or not isinstance(rec.get("upserted"), int):
             raise KRagError("Batch merge relationships by property failed; no count")
         return int(rec.get("upserted") or 0)
 
-    def delete_relationship(
+    async def delete_relationship(
         self,
         from_label: str,
         from_key: str,
@@ -1049,8 +1050,8 @@ class NodeManager:
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
         self._validate_identifier(rel_type)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         filters: List[str] = []
         params = {"fromVal": from_value, "toVal": to_value}
         if rel_props:
@@ -1069,7 +1070,7 @@ class NodeManager:
             f"DELETE r "
             f"RETURN count(r) AS deleted"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             params,
             readonly=False,
@@ -1078,7 +1079,7 @@ class NodeManager:
             raise KRagError("Delete relationship failed; no count")
         return int(rec.get("deleted") or 0)
         
-    def delete_relationships(
+    async def delete_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -1113,8 +1114,8 @@ class NodeManager:
         self._validate_identifier(rel_type)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         if not pairs:
             return 0
         if rel_types is not None:
@@ -1151,12 +1152,12 @@ class NodeManager:
             f"DELETE r "
             f"RETURN count(r) AS deleted"
         )
-        rec = self._client.execute_single(cypher, params, readonly=False)
+        rec = await self._client.execute_single(cypher, params, readonly=False)
         if not rec or not isinstance(rec.get("deleted"), int):
             raise KRagError("Batch delete relationships failed; no count")
         return int(rec.get("deleted") or 0)
 
-    def delete_relationships_by_property(
+    async def delete_relationships_by_property(
         self,
         from_label: str,
         from_key: str,
@@ -1230,12 +1231,12 @@ class NodeManager:
             f"DELETE r "
             f"RETURN count(r) AS deleted"
         )
-        rec = self._client.execute_single(cypher, params, readonly=False)
+        rec = await self._client.execute_single(cypher, params, readonly=False)
         if not rec or not isinstance(rec.get("deleted"), int):
             raise KRagError("Batch delete relationships by property failed; no count")
         return int(rec.get("deleted") or 0)
 
-    def delete_all_relationships(
+    async def delete_all_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -1264,8 +1265,8 @@ class NodeManager:
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         cypher = (
             f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}), "
             f"      (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
@@ -1279,7 +1280,7 @@ class NodeManager:
             f"FOREACH (x IN in_rels | DELETE x) "
             f"RETURN c_out + size(in_rels) AS deleted"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {"fromVal": from_value, "toVal": to_value, "both": bool(both_directions)},
             readonly=False,
@@ -1288,7 +1289,7 @@ class NodeManager:
             raise KRagError("Delete all relationships failed; no count")
         return int(rec.get("deleted") or 0)
 
-    def delete_all_relationships_by_property(
+    async def delete_all_relationships_by_property(
         self,
         from_label: str,
         from_key: str,
@@ -1333,7 +1334,7 @@ class NodeManager:
             f"FOREACH (x IN in_rels | DELETE x) "
             f"RETURN c_out + size(in_rels) AS deleted"
         )
-        rec = self._client.execute_single(
+        rec = await self._client.execute_single(
             cypher,
             {"fromVal": from_value, "toVal": to_value, "both": bool(both_directions)},
             readonly=False,
@@ -1343,7 +1344,7 @@ class NodeManager:
         return int(rec.get("deleted") or 0)
 
 
-    def get_relationships(
+    async def get_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -1374,8 +1375,8 @@ class NodeManager:
         self._validate_identifier(from_key)
         self._validate_identifier(to_label)
         self._validate_identifier(to_key)
-        self._ensure_unique_key(from_label, from_key)
-        self._ensure_unique_key(to_label, to_key)
+        await self._ensure_unique_key(from_label, from_key)
+        await self._ensure_unique_key(to_label, to_key)
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
@@ -1396,10 +1397,10 @@ class NodeManager:
             "types": rel_types,
             "include": bool(include_rel_props),
         }
-        rows = self._client.execute(cypher, params, readonly=True)
+        rows = await self._client.execute(cypher, params, readonly=True)
         return list(rows)
 
-    def get_all_relationships(
+    async def get_all_relationships(
         self,
         from_label: str,
         from_key: str,
@@ -1421,7 +1422,7 @@ class NodeManager:
         Returns:
             关系列表（同 get_relationships）。
         """
-        return self.get_relationships(
+        return await self.get_relationships(
             from_label,
             from_key,
             from_value,

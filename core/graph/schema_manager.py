@@ -81,7 +81,7 @@ class SchemaManager:
             relationships=data.get("relationships", []) or [],
         )
 
-    def apply(
+    async def apply(
         self,
         cfg: SchemaConfig,
         *,
@@ -104,13 +104,13 @@ class SchemaManager:
         """
         self.validate(cfg)
         if drop_missing:
-            self._drop_missing(cfg)
+            await self._drop_missing(cfg)
         for label in cfg.labels:
-            self._apply_label(label)
+            await self._apply_label(label)
         for rel in cfg.relationships:
-            self._apply_relationship(rel)
+            await self._apply_relationship(rel)
         if drop_missing:
-            self.prune_removed_properties(cfg, dry_run=False)
+            await self.prune_removed_properties(cfg, dry_run=False)
 
     def validate(self, cfg: SchemaConfig) -> None:
         """
@@ -200,7 +200,7 @@ class SchemaManager:
                         f"Neo4j 5+ does not support existence constraints on relationship properties: {r_type}.{p_name}"
                     )
 
-    def _apply_label(self, label_cfg: Dict[str, Any]) -> None:
+    async def _apply_label(self, label_cfg: Dict[str, Any]) -> None:
         """
         应用节点标签的唯一约束、BTREE 索引与向量索引。
 
@@ -229,7 +229,7 @@ class SchemaManager:
                     "CREATE CONSTRAINT %s IF NOT EXISTS FOR (n:%s) REQUIRE n.%s IS UNIQUE"
                     % (self._q(name), self._q(label), self._q(pname)) 
                 )
-                self._client.execute(cypher)
+                await self._client.execute(cypher)
 
         for idx in label_cfg.get("indexes", []) or []:
             if idx.get("type") == "btree":
@@ -254,7 +254,7 @@ class SchemaManager:
                         "CREATE INDEX %s IF NOT EXISTS FOR (n:%s) ON (%s)"
                         % (self._q(name), self._q(label), props_list)
                     )
-                self._client.execute(cypher)
+                await self._client.execute(cypher)
 
         for prop in label_cfg.get("properties", []) or []:
             if prop.get("type") == "vector":
@@ -279,9 +279,9 @@ class SchemaManager:
                     """
                     % (self._q(name), self._q(label), self._q(pname)) 
                 )
-                self._client.execute(cypher, {"dimension": dimension, "similarity": similarity})
+                await self._client.execute(cypher, {"dimension": dimension, "similarity": similarity})
 
-    def _apply_relationship(self, rel_cfg: Dict[str, Any]) -> None:
+    async def _apply_relationship(self, rel_cfg: Dict[str, Any]) -> None:
         """
         应用关系属性索引（可选）。
 
@@ -310,7 +310,7 @@ class SchemaManager:
                     "CREATE INDEX %s IF NOT EXISTS FOR ()-[r:%s]-() ON (r.%s)"
                     % (self._q(iname), self._q(rtype), self._q(pname))
                 )
-                self._client.execute(cypher)
+                await self._client.execute(cypher)
 
     def _desired_names(self, cfg: SchemaConfig) -> Dict[str, set]:
         """
@@ -356,7 +356,7 @@ class SchemaManager:
 
         return {"constraints": desired_constraints, "indexes": desired_indexes}
 
-    def _existing_names(self) -> Dict[str, set]:
+    async def _existing_names(self) -> Dict[str, set]:
         """
         查询当前数据库中（按命名前缀）可见的对象名集合。
 
@@ -366,7 +366,7 @@ class SchemaManager:
         existing_constraints = set()
         existing_indexes = set()
 
-        rows = self._client.execute(
+        rows = await self._client.execute(
             "SHOW CONSTRAINTS YIELD name RETURN name",
             readonly=True,
         )
@@ -377,7 +377,7 @@ class SchemaManager:
             ):
                 existing_constraints.add(name)
 
-        rows = self._client.execute(
+        rows = await self._client.execute(
             "SHOW INDEXES YIELD name RETURN name",
             readonly=True,
         )
@@ -390,7 +390,7 @@ class SchemaManager:
 
         return {"constraints": existing_constraints, "indexes": existing_indexes}
 
-    def _existing_objects(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    async def _existing_objects(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """
         列出所有索引与约束的结构化信息（用于精确判断与比对）。
 
@@ -400,7 +400,7 @@ class SchemaManager:
         constraints: Dict[str, Dict[str, Any]] = {}
         indexes: Dict[str, Dict[str, Any]] = {}
 
-        c_rows = self._client.execute(
+        c_rows = await self._client.execute(
             "SHOW CONSTRAINTS YIELD name, entityType, labelsOrTypes, properties RETURN name, entityType, labelsOrTypes, properties",
             readonly=True,
         )
@@ -413,7 +413,7 @@ class SchemaManager:
                     "properties": r.get("properties") or [],
                 }
 
-        i_rows = self._client.execute(
+        i_rows = await self._client.execute(
             "SHOW INDEXES YIELD name, entityType, labelsOrTypes, properties, options RETURN name, entityType, labelsOrTypes, properties, options",
             readonly=True,
         )
@@ -448,7 +448,7 @@ class SchemaManager:
         #     return False
         return True
 
-    def _drop_missing(
+    async def _drop_missing(
         self,
         cfg: SchemaConfig,
     ) -> None:
@@ -463,8 +463,8 @@ class SchemaManager:
             - 避免误删外部对象，但仍建议在受控环境且留有备份时执行。
         """
         desired = self._desired_names(cfg)
-        existing = self._existing_names()
-        details = self._existing_objects()
+        existing = await self._existing_names()
+        details = await self._existing_objects()
         details_constraints = details.get("constraints", {})
         details_indexes = details.get("indexes", {})
 
@@ -514,7 +514,7 @@ class SchemaManager:
             if canon != name:
                 continue
             cypher = f"DROP CONSTRAINT {self._q(name)} IF EXISTS"
-            self._client.execute(cypher)
+            await self._client.execute(cypher)
 
         to_drop_indexes = existing["indexes"] - desired["indexes"]
         for name in to_drop_indexes:
@@ -534,7 +534,7 @@ class SchemaManager:
                 if canon != name:
                     continue
             cypher = f"DROP INDEX {self._q(name)} IF EXISTS"
-            self._client.execute(cypher)
+            await self._client.execute(cypher)
 
         desired_vec_options: Dict[str, Dict[str, Any]] = {}
         for label in cfg.labels:
@@ -570,9 +570,9 @@ class SchemaManager:
                 isinstance(current_sim, str) and current_sim.lower() != str(want.get("vector.similarity_function")).lower()
             ):
                 cypher = f"DROP INDEX {self._q(name)} IF EXISTS"
-                self._client.execute(cypher)
+                await self._client.execute(cypher)
 
-    def prune_removed_properties(
+    async def prune_removed_properties(
         self,
         cfg: SchemaConfig,
         *,
@@ -616,7 +616,7 @@ class SchemaManager:
 
             existing: set = set()
             try:
-                rows = self._client.execute(
+                rows = await self._client.execute(
                     (
                         "CALL db.schema.nodeTypeProperties() "
                         "YIELD nodeLabels, propertyName "
@@ -659,7 +659,7 @@ class SchemaManager:
                             "perNodePropLimit": int(per_node_prop_limit or 64),
                             "batchSize": int(batch_size or 500),
                         }
-                    rows = self._client.execute(cypher, params, readonly=True)
+                    rows = await self._client.execute(cypher, params, readonly=True)
                 except Exception:
                     if sample_limit is None:
                         cypher = (
@@ -675,7 +675,7 @@ class SchemaManager:
                             f"RETURN DISTINCT k"
                         )
                         params = {"limit": int(sample_limit), "perNodePropLimit": int(per_node_prop_limit or 64)}
-                    rows = self._client.execute(cypher, params, readonly=True)
+                    rows = await self._client.execute(cypher, params, readonly=True)
             existing = {r.get("k") for r in rows if isinstance(r.get("k"), str)}
             to_remove = sorted(existing - allowed)
             plan[lname] = to_remove
@@ -696,7 +696,7 @@ class SchemaManager:
                         f"AND ALL(lbl IN $protect WHERE NOT lbl IN labels(n)) "
                         f"REMOVE n.{self._q(prop)}"
                     )
-                    self._client.execute(rm_cypher, {"protect": protect_labels})
+                    await self._client.execute(rm_cypher, {"protect": protect_labels})
 
         return plan
 
