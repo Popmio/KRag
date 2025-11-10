@@ -380,3 +380,91 @@ async def test_merge_relationship_skip_missing(nm: NodeManager):
     res = await nm.merge_relationship("Document", "id", a, "CITES", "Document", "id", "no_such_doc", {})
     assert res is None
     await nm.delete_node("Document", "id", a)
+
+
+# 向量相似检索（KNN）测试：在 Content.label 上使用 text_embedding 的向量索引进行相似度查询
+@pytest.mark.asyncio
+async def test_vector_similarity_search(nm: NodeManager, neo4j_client):
+    # 检查数据库是否支持向量检索
+    rec = await neo4j_client.execute_single(
+        "SHOW PROCEDURES YIELD name WHERE name = 'db.index.vector.queryNodes' RETURN count(*) AS cnt",
+        readonly=True,
+    )
+    if not rec or int(rec.get("cnt") or 0) == 0:
+        pytest.skip("Neo4j does not support db.index.vector.queryNodes on this server")
+
+    # 等待索引 ONLINE（确保可用）
+    try:
+        await neo4j_client.execute("CALL db.awaitIndexes(300)")
+    except Exception:
+        # 某些版本无 awaitIndexes，忽略
+        pass
+
+    # 获取 Content.text_embedding 的索引维度（若失败则回退 768）
+    dim = 768
+    try:
+        idx_rec = await neo4j_client.execute_single(
+            "SHOW INDEXES YIELD name, options WHERE name = $name RETURN options AS opts",
+            {"name": "vec_content_text_embedding"},
+            readonly=True,
+        )
+        if idx_rec and isinstance(idx_rec.get("opts"), dict):
+            opts = idx_rec["opts"] or {}
+            cfg = opts.get("indexConfig") or opts
+            maybe_dim = cfg.get("vector.dimensions")
+            if isinstance(maybe_dim, int) and maybe_dim > 0:
+                dim = maybe_dim
+    except Exception:
+        pass
+
+    # 构造三条样本向量：v1 ~ e1，v2 ~ 0.9e1+0.1e2（与 v1 高相似），v3 ~ e2（与 v1 低相似）
+    def unit(i: int) -> list[float]:
+        v = [0.0] * dim
+        v[i] = 1.0
+        return v
+
+    v1 = unit(0)
+    v2 = [0.0] * dim
+    v2[0] = 0.9
+    v2[1] = 0.1
+    v3 = unit(1)
+
+    # 创建三个 Content 节点（通过 NodeManager 合并主键；向量属性用直连 Cypher 写入，避免维度验证干扰）
+    a = f"c_{uuid.uuid4().hex[:6]}"
+    b = f"c_{uuid.uuid4().hex[:6]}"
+    c = f"c_{uuid.uuid4().hex[:6]}"
+    await nm.merge_node("Content", key="content_id", properties={"content_id": a})
+    await nm.merge_node("Content", key="content_id", properties={"content_id": b})
+    await nm.merge_node("Content", key="content_id", properties={"content_id": c})
+    await neo4j_client.execute(
+        "MATCH (n:`Content` {`content_id`: $id}) SET n.`text_embedding` = $vec",
+        {"id": a, "vec": v1},
+    )
+    await neo4j_client.execute(
+        "MATCH (n:`Content` {`content_id`: $id}) SET n.`text_embedding` = $vec",
+        {"id": b, "vec": v2},
+    )
+    await neo4j_client.execute(
+        "MATCH (n:`Content` {`content_id`: $id}) SET n.`text_embedding` = $vec",
+        {"id": c, "vec": v3},
+    )
+
+    # 以 v1 为查询向量进行 KNN 检索，期望返回顺序为 a（自身） > b > c
+    results = await nm.vector_search("Content", "text_embedding", v1, top_k=3, include_score=True)
+    assert results and len(results) >= 2
+    # 新返回字段：node_id 与 labels
+    assert isinstance(results[0].get("node_id"), int)
+    assert "Content" in (results[0].get("labels") or [])
+
+    ids = [r.get("node", {}).get("content_id") for r in results]
+    assert ids[0] == a
+    assert b in ids[:2]  # b 应当是次优
+
+    # 阈值过滤：cosine 下 0.9999 仅应命中自身
+    results_thr = await nm.vector_search("Content", "text_embedding", v1, top_k=3, include_score=True, score_threshold=0.9999)
+    assert results_thr and len(results_thr) >= 1
+    thr_ids = [r.get("node", {}).get("content_id") for r in results_thr]
+    assert thr_ids[0] == a
+
+    # 清理
+    await nm.delete_nodes("Content", "content_id", [a, b, c])

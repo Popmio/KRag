@@ -44,6 +44,7 @@ class NodeManager:
     节点与关系的 CRUD 统一管理器（基于 Neo4j Cypher）。
 
     设计要点（重要）：
+    
     - 单项操作（get_node/merge_node/update_node/delete_node 等）要求 `(label.key)` 为唯一约束，避免返回多行导致的语义不确定。
     - 批量/按属性变体（…_by_property）不要求唯一性，可能命中大量实体，需谨慎使用并控制范围/批大小。
     - 并发控制：update_node / update_nodes 使用乐观并发控制（OCC），通过快照比对避免“丢失更新”。
@@ -1432,4 +1433,92 @@ class NodeManager:
             rel_types=None,
             include_rel_props=include_rel_props,
         )
+
+    async def vector_search(
+        self,
+        label: str,
+        vector_property: str,
+        query_vector: List[float],
+        top_k: int = 10,
+        *,
+        filters: Optional[Dict[str, Any]] = None,
+        include_score: bool = True,
+        score_threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        向量相似检索（KNN on VECTOR INDEX）。
+
+        Args:
+            label: 目标节点标签（需在 schema 中为 `vector_property` 建立向量索引）。
+            vector_property: 向量属性名称（与索引一致）。
+            query_vector: 查询向量（长度需与索引维度一致）。
+            top_k: 返回的相似结果数量上限。
+            filters: 额外的属性过滤（可选，等值过滤）。
+            include_score: 结果中是否包含相似度分数 `score`。
+            score_threshold: 相似度下限（仅当相似度为“值越大越相似”的度量如 cosine/dot 时语义一致；若为距离度量如 euclidean，该阈值不适用）。
+
+        Returns:
+            列表：每项为 {"node_id": int, "labels": List[str], "node": dict, "score": float?}
+
+        Raises:
+            ValueError: 参数不合法（标识符、top_k、query_vector 类型）。
+            KRagError: 数据库不支持向量检索或执行失败。
+
+        Notes:
+            - 需要 Neo4j 5.11+ 且开启向量索引功能；
+            - 索引名按约定为 `vec_{label_lower}_{vector_property}`，需先通过 SchemaManager.apply 创建；
+            - 维度不匹配会在数据库侧报错（Dimension mismatch）；
+            - filters 为等值过滤，复杂过滤建议上层先筛选候选集再做 re-rank；
+            - score_threshold 以“分数越高越好”的相似度为语义（例如 cosine/dot）。若索引使用 euclidean 距离，该阈值不建议使用。
+        """
+        self._validate_identifier(label)
+        self._validate_identifier(vector_property)
+        if not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
+        if not isinstance(query_vector, list) or not query_vector or not all(
+            isinstance(x, (int, float)) for x in query_vector
+        ):
+            raise ValueError("query_vector must be a non-empty list of numbers")
+        index_name = f"vec_{label.lower()}_{vector_property}"
+
+        # 构造等值过滤（静态属性键，参数值）
+        where_clauses: List[str] = []
+        params: Dict[str, Any] = {"index": index_name, "k": int(top_k), "vec": [float(x) for x in query_vector]}
+        if filters:
+            for idx, (k, v) in enumerate(filters.items()):
+                if not isinstance(k, str):
+                    raise DataValidationError("Filter property keys must be strings")
+                pname = f"fp{idx}"
+                where_clauses.append(f"node.{self._q(k)} = ${pname}")
+                params[pname] = v
+        if score_threshold is not None:
+            if not isinstance(score_threshold, (int, float)):
+                raise ValueError("score_threshold must be a number")
+            params["threshold"] = float(score_threshold)
+            where_clauses.append("score >= $threshold")
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        cypher = (
+            "CALL db.index.vector.queryNodes($index, $k, $vec) "
+            "YIELD node, score "
+            f"{where_sql} "
+            "RETURN id(node) AS node_id, labels(node) AS labels, properties(node) AS node, score "
+            "ORDER BY score DESC "
+            "LIMIT $k"
+        )
+        try:
+            rows = await self._client.execute(cypher, params, readonly=True)
+        except Exception as e:
+            raise KRagError(f"Vector search failed: {e}")
+        results: List[Dict[str, Any]] = []
+        for r in rows:
+            item = {
+                "node_id": r.get("node_id"),
+                "labels": r.get("labels"),
+                "node": r.get("node"),
+            }
+            if include_score:
+                item["score"] = r.get("score")
+            results.append(item)
+        return results
 
