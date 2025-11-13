@@ -1,42 +1,16 @@
 from __future__ import annotations
-
-import re
-from typing import Any, Dict, Optional, List, Type
+from typing import Any, Dict, Optional, List
 
 from .neo4j_client import Neo4jClient
-from pydantic import BaseModel, ValidationError
 from common.exceptions import DataValidationError, KRagError
-from common.models.KGnode import (
-    PathNode,
-    DocumentNode,
-    TitleNode,
-    ClauseNode,
-    ContentNode,
-    KeywordNode,
-    OrganizationNode,
-    ContainsRel,
-    PublishedByRel,
-    CitesRel,
-    HasKeywordRel,
+from common.utils.cypher_builder import (
+    validate_identifier,
+    validate_node_properties,
+    validate_rel_properties,
+    q
 )
-
-_NODE_MODELS: Dict[str, Type[BaseModel]] = {
-    "Path": PathNode,
-    "Document": DocumentNode,
-    "Title": TitleNode,
-    "Clause": ClauseNode,
-    "Content": ContentNode,
-    "Keyword": KeywordNode,
-    "Organization": OrganizationNode,
-}
-
-_REL_MODELS: Dict[str, Type[BaseModel]] = {
-    "CONTAINS": ContainsRel,
-    "PUBLISHED_BY": PublishedByRel,
-    "CITES": CitesRel,
-    "HAS_KEYWORD": HasKeywordRel,
-}
-
+from common.models.Mapping import NODE_MODELS as node_models
+from common.models.Mapping import REL_MODELS as rel_models
 
 class NodeManager:
 
@@ -64,41 +38,6 @@ class NodeManager:
         """
         self._client = client
         self._unique_key_cache: Dict[str, Dict[str, bool]] = {}
-
-    @staticmethod
-    def _q(identifier: str) -> str:
-        return f"`{identifier}`"
-
-    @staticmethod
-    def _validate_identifier(name: str) -> None:
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-            raise ValueError(f"Invalid identifier: {name}")
-
-    @staticmethod
-    def _validate_node_properties(label: str, properties: Dict[str, Any]) -> Dict[str, Any]:
-        model = _NODE_MODELS.get(label)
-        if model is None:
-            raise ValueError(f"Node label '{label}' is not allowed. Supported labels: {list(_NODE_MODELS.keys())}")
-            # 宽松检查可替换
-            # logger.warning(f"Creating node with unvalidated label: {label}")
-            # return properties
-        try:
-            return model(**properties).model_dump()
-        except ValidationError as e:
-            raise DataValidationError(str(e))
-
-    @staticmethod
-    def _validate_rel_properties(rel_type: str, properties: Dict[str, Any]) -> Dict[str, Any]:
-        model = _REL_MODELS.get(rel_type)
-        if model is None:
-            raise ValueError(
-                f"Relationship type '{rel_type}' is not allowed. Supported: {list(_REL_MODELS.keys())}"
-            )
-        try:
-            return model(**(properties or {})).model_dump()
-        except ValidationError as e:
-            raise DataValidationError(str(e))
-
 
     async def _is_unique_key(self, label: str, key: str) -> bool:
         cache_for_label = self._unique_key_cache.setdefault(label, {})
@@ -150,15 +89,15 @@ class NodeManager:
               建议结合幂等/重试策略。
             - 请勿在 `properties` 中修改主键值；主键仅用于定位。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         if key not in properties:
             raise DataValidationError(f"Primary key '{key}' missing from node properties")
-        props = self._validate_node_properties(label, properties)
+        props = validate_node_properties(label, properties, node_models)
         props_no_key = {k: v for k, v in props.items() if k != key}
         cypher = (
-            f"MERGE (n:{self._q(label)} {{{self._q(key)}: $keyVal}}) "
+            f"MERGE (n:{q(label)} {{{q(key)}: $keyVal}}) "
             "ON CREATE SET n += $propsNoKey "
             "WITH n, $propsNoKey AS props "
             "WITH n, props, [k IN keys(props) WHERE n[k] IS NULL] AS toSet "
@@ -192,11 +131,11 @@ class NodeManager:
         """
         if value is None:
             raise ValueError(f"Cannot query node by {key}=None")
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         cypher = (
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: $val}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: $val}}) "
             f"RETURN properties(n) AS node LIMIT 1"
         )
         return await self._client.execute_single(cypher, {"val": value}, readonly=True)
@@ -218,8 +157,8 @@ class NodeManager:
         Notes:
             - 请控制 `values` 数量，避免过大 UNWIND 造成内存压力。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         if not isinstance(values, list) or not values:
             raise ValueError("Invalid values: expected a non-empty list")
         values = [v for v in values if v is not None]
@@ -227,7 +166,7 @@ class NodeManager:
             raise ValueError(f"No valid (non-null) values provided for {label}.{key}")
         cypher = (
             f"UNWIND $vals AS v "
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: v}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: v}}) "
             f"RETURN DISTINCT properties(n) AS node"
         )
         rows = await self._client.execute(cypher, {"vals": values}, readonly=True)
@@ -270,26 +209,26 @@ class NodeManager:
             - `limit` 在服务端聚合后切片，超大结果仍可能有内存压力；
             - 将 `include_rel_props=False` 可减小返回体积。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         if direction not in {"out", "in", "both"}:
             raise ValueError("direction must be 'out', 'in', or 'both'")
         if rel_types is not None:
             for rt in rel_types:
-                self._validate_identifier(rt)
+                validate_identifier(rt)
         if neighbor_labels is not None:
             for lb in neighbor_labels:
-                self._validate_identifier(lb)
+                validate_identifier(lb)
 
         if neighbor_labels:
-            label_predicate = " AND (" + " OR ".join([f"m:{self._q(lb)}" for lb in neighbor_labels]) + ")"
+            label_predicate = " AND (" + " OR ".join([f"m:{q(lb)}" for lb in neighbor_labels]) + ")"
         else:
             label_predicate = ""
 
         cypher = (
             f"""
-            MATCH (n:{self._q(label)} {{{self._q(key)}: $val}})
+            MATCH (n:{q(label)} {{{q(key)}: $val}})
             WITH n
             WITH n,
                  [ (n)-[r]->(m)
@@ -349,8 +288,8 @@ class NodeManager:
             DataValidationError: 属性校验失败。
             KRagError: 未找到节点或并发冲突（快照不匹配）。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         if value is None:
             raise ValueError(f"Cannot update node by {label}.{key}=None")
@@ -364,12 +303,12 @@ class NodeManager:
         if not current or not isinstance(current.get("node"), dict):
             raise KRagError(f"Node not found for {label}.{key}={value}")
         merged = {**current["node"], **updates}
-        sanitized = self._validate_node_properties(label, merged)
+        sanitized = validate_node_properties(label, merged, node_models)
         sanitized_updates = {k: sanitized.get(k) for k in updates.keys() if k != key}
         expected_snapshot = {k: current["node"].get(k) for k in sanitized_updates.keys()}
         sentinel = "__KRAG__NULL__SENTINEL__"
         cypher = (
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: $val}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: $val}}) "
             f"WITH n, $updates AS updates, $expected AS expected, $sentinel AS sentinel "
             f"WHERE ALL(k IN keys(updates) WHERE coalesce(properties(n)[k], sentinel) = coalesce(expected[k], sentinel)) "
             f"SET n += updates "
@@ -399,21 +338,21 @@ class NodeManager:
             DataValidationError: 缺少主键或属性校验失败。
             KRagError: 数据库未返回计数。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         rows: List[Dict[str, Any]] = []
         for it in items or []:
             if key not in it:
                 raise DataValidationError(f"Primary key '{key}' missing from item")
-            props = self._validate_node_properties(label, it)
+            props = validate_node_properties(label, it, node_models)
             props_no_key = {k: v for k, v in props.items() if k != key}
             rows.append({"key": props[key], "propsNoKey": props_no_key})
         if not rows:
             return 0
         cypher = (
             f"UNWIND $rows AS row "
-            f"MERGE (n:{self._q(label)} {{{self._q(key)}: row.key}}) "
+            f"MERGE (n:{q(label)} {{{q(key)}: row.key}}) "
             f"ON CREATE SET n += row.propsNoKey "
             f"WITH n, row.propsNoKey AS props "
             f"WITH n, props, [k IN keys(props) WHERE n[k] IS NULL] AS toSet "
@@ -444,8 +383,8 @@ class NodeManager:
         Notes:
             - 建议控制批大小，避免长事务导致锁竞争。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         if not items:
             return 0
         rows: List[Dict[str, Any]] = []
@@ -461,13 +400,13 @@ class NodeManager:
             if not updates_only:
                 raise ValueError(f"No updatable fields provided for {label}.{key}={k}")
             merged = {**current["node"], **updates_only}
-            sanitized = self._validate_node_properties(label, merged)
+            sanitized = validate_node_properties(label, merged, node_models)
             sanitized_updates = {kk: sanitized.get(kk) for kk in updates_only.keys()}
             expected_snapshot = {kk: current["node"].get(kk) for kk in sanitized_updates.keys()}
             rows.append({"key": k, "updates": sanitized_updates, "expected": expected_snapshot})
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: row.key}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: row.key}}) "
             f"WITH n, row, $sentinel AS sentinel "
             f"WHERE ALL(k IN keys(row.updates) WHERE coalesce(properties(n)[k], sentinel) = coalesce(row.expected[k], sentinel)) "
             f"SET n += row.updates "
@@ -504,8 +443,8 @@ class NodeManager:
             - 无 OCC 保护，适合作业/离线小范围修正；
             - 建议在上层限制选择性或分批执行。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         if value is None:
             raise ValueError(f"Cannot update nodes by {label}.{key}=None")
         if not isinstance(updates, dict) or not updates:
@@ -514,15 +453,15 @@ class NodeManager:
             updates = {k: v for k, v in updates.items() if k != key}
         if not updates:
             raise ValueError("No updatable fields provided (match key cannot be updated)")
-        model = _NODE_MODELS.get(label)
+        model = node_models.get(label)
         if model is None:
-            raise ValueError(f"Node label '{label}' is not allowed. Supported labels: {list(_NODE_MODELS.keys())}")
+            raise ValueError(f"Node label '{label}' is not allowed. Supported labels: {list(node_models.keys())}")
         allowed_keys = set(getattr(model, "model_fields", {}).keys())
         unknown = [k for k in updates.keys() if k not in allowed_keys]
         if unknown:
             raise DataValidationError(f"Unknown properties for label {label}: {unknown}")
         cypher = (
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: $val}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: $val}}) "
             f"SET n += $updates "
             f"RETURN count(n) AS updated"
         )
@@ -547,13 +486,13 @@ class NodeManager:
             ValueError: value 为空或标识符不合法。
             KRagError: 发现重复节点时拒绝删除。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         if value is None:
             raise ValueError(f"Cannot delete node by {label}.{key}=None")
         cypher = (
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: $val}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: $val}}) "
             f"WITH collect(n) AS nodes "
             f"WITH nodes, size(nodes) AS cnt "
             f"CALL {{ WITH nodes, cnt "
@@ -590,8 +529,8 @@ class NodeManager:
         Notes:
             - 会对输入进行去重与过滤 None。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         await self._ensure_unique_key(label, key)
         if not isinstance(values, list) or not values:
             return 0
@@ -608,7 +547,7 @@ class NodeManager:
             return 0
         cypher = (
             f"UNWIND $vals AS v "
-            f"OPTIONAL MATCH (n:{self._q(label)} {{{self._q(key)}: v}}) "
+            f"OPTIONAL MATCH (n:{q(label)} {{{q(key)}: v}}) "
             f"WITH v, collect(n) AS nodes, size([x IN collect(n) WHERE x IS NOT NULL]) AS cnt "
             f"WITH collect({{v:v, nodes:nodes, cnt:cnt}}) AS rows "
             f"WITH rows, reduce(x=0, r IN rows | x + CASE WHEN r.cnt > 1 THEN 1 ELSE 0 END) AS dup_count "
@@ -651,8 +590,8 @@ class NodeManager:
             - DETACH DELETE 会删除节点及其所有关系，属于破坏性操作；
             - 可能删除大量节点，务必范围可控并做好备份。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(key)
+        validate_identifier(label)
+        validate_identifier(key)
         if not isinstance(values, list) or not values:
             return 0
         seen: set = set()
@@ -668,7 +607,7 @@ class NodeManager:
             return 0
         cypher = (
             f"UNWIND $vals AS v "
-            f"MATCH (n:{self._q(label)} {{{self._q(key)}: v}}) "
+            f"MATCH (n:{q(label)} {{{q(key)}: v}}) "
             f"WITH collect(n) AS nodes "
             f"UNWIND nodes AS n "
             f"DETACH DELETE n "
@@ -710,18 +649,18 @@ class NodeManager:
             ValueError/DataValidationError: 标识符或属性校验失败。
             KRagError: 端点不存在或数据库未返回记录。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
-        self._validate_identifier(rel_type)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
+        validate_identifier(rel_type)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
-        rprops = self._validate_rel_properties(rel_type, properties or {})
+        rprops = validate_rel_properties(rel_type, properties or {}, rel_models)
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
-            f"CREATE (a)-[r:{self._q(rel_type)}]->(b) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: $toVal}}) "
+            f"CREATE (a)-[r:{q(rel_type)}]->(b) "
             f"SET r += $rprops "
             f"RETURN type(r) AS rel, properties(r) AS rprops"
         )
@@ -763,11 +702,11 @@ class NodeManager:
         Notes:
             - 保证“要么全成，要么全不成”。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
-        self._validate_identifier(rel_type)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
+        validate_identifier(rel_type)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         if not pairs:
@@ -776,13 +715,13 @@ class NodeManager:
         for p in pairs:
             fv = p.get("from_value")
             tv = p.get("to_value")
-            rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
+            rprops = validate_rel_properties(rel_type, p.get("properties") or {}, rel_models)
             rows.append({"fv": fv, "tv": tv, "props": rprops})
 
         cypher = (
             f"UNWIND $rows AS row "
-            f"OPTIONAL MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"OPTIONAL MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
+            f"OPTIONAL MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"OPTIONAL MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
             f"WITH row, a, b "
             f"WITH collect({{a:a, b:b, props: row.props, ok: a IS NOT NULL AND b IS NOT NULL}}) AS rs "
             f"WITH rs, reduce(m=0, r IN rs | m + CASE WHEN r.ok THEN 0 ELSE 1 END) AS missing "
@@ -790,7 +729,7 @@ class NodeManager:
             f"  WITH rs WHERE missing = 0 "
             f"  UNWIND rs AS r "
             f"  WITH r WHERE r.ok "
-            f"  CREATE (r.a)-[rel:{self._q(rel_type)}]->(r.b) "
+            f"  CREATE (r.a)-[rel:{q(rel_type)}]->(r.b) "
             f"  SET rel += r.props "
             f"  RETURN count(*) AS created_inner "
             f"}} "
@@ -836,24 +775,24 @@ class NodeManager:
             - 每对 (from_value, to_value) 可匹配多节点，实际创建数为 A×B（笛卡尔乘积），存在“爆炸”风险；
             - 建议限制选择性并控制批次规模。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
-        self._validate_identifier(rel_type)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
+        validate_identifier(rel_type)
         if not pairs:
             return 0
         rows: List[Dict[str, Any]] = []
         for p in pairs:
             fv = p.get("from_value")
             tv = p.get("to_value")
-            rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
+            rprops = validate_rel_properties(rel_type, p.get("properties") or {}, rel_models)
             rows.append({"fv": fv, "tv": tv, "props": rprops})
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
-            f"CREATE (a)-[rel:{self._q(rel_type)}]->(b) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
+            f"CREATE (a)-[rel:{q(rel_type)}]->(b) "
             f"SET rel += row.props "
             f"RETURN count(rel) AS created"
         )
@@ -890,18 +829,18 @@ class NodeManager:
         Notes:
             - 不创建端点节点，仅在两端都存在时进行 MERGE。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
-        self._validate_identifier(rel_type)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
+        validate_identifier(rel_type)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
-        rprops = self._validate_rel_properties(rel_type, properties or {})
+        rprops = validate_rel_properties(rel_type, properties or {}, rel_models)
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
-            f"MERGE (a)-[r:{self._q(rel_type)}]->(b) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: $toVal}}) "
+            f"MERGE (a)-[r:{q(rel_type)}]->(b) "
             f"SET r += $rprops "
             f"RETURN type(r) AS rel, properties(r) AS rprops"
         )
@@ -937,11 +876,11 @@ class NodeManager:
             DataValidationError: 属性校验失败。
             KRagError: 数据库未返回计数。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(rel_type)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(rel_type)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         if not pairs:
@@ -950,13 +889,13 @@ class NodeManager:
         for p in pairs:
             fv = p.get("from_value")
             tv = p.get("to_value")
-            rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
+            rprops = validate_rel_properties(rel_type, p.get("properties") or {}, rel_models)
             rows.append({"fv": fv, "tv": tv, "props": rprops})
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
-            f"MERGE (a)-[r:{self._q(rel_type)}]->(b) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
+            f"MERGE (a)-[r:{q(rel_type)}]->(b) "
             f"SET r += row.props "
             f"RETURN count(*) AS upserted"
         )
@@ -993,24 +932,24 @@ class NodeManager:
         Notes:
             - 可能出现 A×B 放大；限制选择性或分批执行。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(rel_type)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(rel_type)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         if not pairs:
             return 0
         rows: List[Dict[str, Any]] = []
         for p in pairs:
             fv = p.get("from_value")
             tv = p.get("to_value")
-            rprops = self._validate_rel_properties(rel_type, p.get("properties") or {})
+            rprops = validate_rel_properties(rel_type, p.get("properties") or {}, rel_models)
             rows.append({"fv": fv, "tv": tv, "props": rprops})
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
-            f"MERGE (a)-[r:{self._q(rel_type)}]->(b) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
+            f"MERGE (a)-[r:{q(rel_type)}]->(b) "
             f"SET r += row.props "
             f"RETURN count(*) AS upserted"
         )
@@ -1046,11 +985,11 @@ class NodeManager:
             DataValidationError: 属性键非字符串。
             KRagError: 数据库未返回计数。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
-        self._validate_identifier(rel_type)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
+        validate_identifier(rel_type)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         filters: List[str] = []
@@ -1060,13 +999,13 @@ class NodeManager:
                 if not isinstance(k, str):
                     raise DataValidationError("Relationship property keys must be strings")
                 pname = f"rp{idx}"
-                filters.append(f"r.{self._q(k)} = ${pname}")
+                filters.append(f"r.{q(k)} = ${pname}")
                 params[pname] = v
         where_clause = (" WHERE " + " AND ".join(filters)) if filters else ""
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}})"
-            f"-[r:{self._q(rel_type)}]->"
-            f"(b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}})"
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}})"
+            f"-[r:{q(rel_type)}]->"
+            f"(b:{q(to_label)} {{{q(to_key)}: $toVal}})"
             f"{where_clause} "
             f"DELETE r "
             f"RETURN count(r) AS deleted"
@@ -1110,11 +1049,11 @@ class NodeManager:
             DataValidationError: rel_types 为空或属性键非字符串。
             KRagError: 数据库未返回计数。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(rel_type)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(rel_type)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         if not pairs:
@@ -1123,7 +1062,7 @@ class NodeManager:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
             for rt in rel_types:
-                self._validate_identifier(rt)
+                validate_identifier(rt)
             types_param = rel_types
         else:
             types_param = [rel_type]
@@ -1141,13 +1080,13 @@ class NodeManager:
                 if not isinstance(k, str):
                     raise DataValidationError("Relationship property keys must be strings")
                 pname = f"rp{idx}"
-                filters.append(f"r.{self._q(k)} = ${pname}")
+                filters.append(f"r.{q(k)} = ${pname}")
                 params[pname] = v
         where_props = (" AND " + " AND ".join(filters)) if filters else ""
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
             f"MATCH (a)-[r]->(b) "
             f"WHERE type(r) IN $types{where_props} "
             f"DELETE r "
@@ -1191,18 +1130,18 @@ class NodeManager:
         Notes:
             - 可能命中大量关系并删除；务必控制选择性。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(rel_type)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(rel_type)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         if not pairs:
             return 0
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
             for rt in rel_types:
-                self._validate_identifier(rt)
+                validate_identifier(rt)
             types_param = rel_types
         else:
             types_param = [rel_type]
@@ -1220,13 +1159,13 @@ class NodeManager:
                 if not isinstance(k, str):
                     raise DataValidationError("Relationship property keys must be strings")
                 pname = f"rp{idx}"
-                filters.append(f"r.{self._q(k)} = ${pname}")
+                filters.append(f"r.{q(k)} = ${pname}")
                 params[pname] = v
         where_props = (" AND " + " AND ".join(filters)) if filters else ""
         cypher = (
             f"UNWIND $rows AS row "
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: row.fv}}) "
-            f"MATCH (b:{self._q(to_label)} {{{self._q(to_key)}: row.tv}}) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: row.fv}}) "
+            f"MATCH (b:{q(to_label)} {{{q(to_key)}: row.tv}}) "
             f"MATCH (a)-[r]->(b) "
             f"WHERE type(r) IN $types{where_props} "
             f"DELETE r "
@@ -1262,15 +1201,15 @@ class NodeManager:
         Raises:
             KRagError: 数据库未返回计数。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}), "
-            f"      (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}}), "
+            f"      (b:{q(to_label)} {{{q(to_key)}: $toVal}}) "
             f"OPTIONAL MATCH (a)-[r_out]->(b) "
             f"WITH a,b, collect(r_out) AS out_rels "
             f"FOREACH (x IN out_rels | DELETE x) "
@@ -1318,13 +1257,13 @@ class NodeManager:
         Notes:
             - 匹配可能产出多对节点，删除量可能远超预期；务必严格控制选择性。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}), "
-            f"      (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}}), "
+            f"      (b:{q(to_label)} {{{q(to_key)}: $toVal}}) "
             f"OPTIONAL MATCH (a)-[r_out]->(b) "
             f"WITH a,b, collect(r_out) AS out_rels "
             f"FOREACH (x IN out_rels | DELETE x) "
@@ -1372,20 +1311,20 @@ class NodeManager:
         Raises:
             DataValidationError: rel_types 为空或类型名不合法。
         """
-        self._validate_identifier(from_label)
-        self._validate_identifier(from_key)
-        self._validate_identifier(to_label)
-        self._validate_identifier(to_key)
+        validate_identifier(from_label)
+        validate_identifier(from_key)
+        validate_identifier(to_label)
+        validate_identifier(to_key)
         await self._ensure_unique_key(from_label, from_key)
         await self._ensure_unique_key(to_label, to_key)
         if rel_types is not None:
             if not rel_types:
                 raise DataValidationError("rel_types cannot be empty")
             for rt in rel_types:
-                self._validate_identifier(rt)
+                validate_identifier(rt)
         cypher = (
-            f"MATCH (a:{self._q(from_label)} {{{self._q(from_key)}: $fromVal}}), "
-            f"      (b:{self._q(to_label)} {{{self._q(to_key)}: $toVal}}) "
+            f"MATCH (a:{q(from_label)} {{{q(from_key)}: $fromVal}}), "
+            f"      (b:{q(to_label)} {{{q(to_key)}: $toVal}}) "
             f"MATCH (a)-[r]->(b) "
             f"WHERE ($types IS NULL OR type(r) IN $types) "
             f"RETURN type(r) AS rel, "
@@ -1473,8 +1412,8 @@ class NodeManager:
             - filters 为等值过滤，复杂过滤建议上层先筛选候选集再做 re-rank；
             - score_threshold 以“分数越高越好”的相似度为语义（例如 cosine/dot）。若索引使用 euclidean 距离，该阈值不建议使用。
         """
-        self._validate_identifier(label)
-        self._validate_identifier(vector_property)
+        validate_identifier(label)
+        validate_identifier(vector_property)
         if not isinstance(top_k, int) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
         if not isinstance(query_vector, list) or not query_vector or not all(
@@ -1492,7 +1431,7 @@ class NodeManager:
                 if not isinstance(k, str):
                     raise DataValidationError("Filter property keys must be strings")
                 pname = f"fp{idx}"
-                where_clauses.append(f"node.{self._q(k)} = ${pname}")
+                where_clauses.append(f"node.{q(k)} = ${pname}")
                 params[pname] = v
         if score_threshold is not None:
             if not isinstance(score_threshold, (int, float)):
