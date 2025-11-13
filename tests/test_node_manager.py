@@ -1,6 +1,7 @@
 import logging
 import os
 import uuid
+import time
 import pytest
 import pytest_asyncio
 
@@ -401,7 +402,7 @@ async def test_vector_similarity_search(nm: NodeManager, neo4j_client):
         pass
 
     # 获取 Content.text_embedding 的索引维度（若失败则回退 768）
-    dim = 768
+    dim = 1024
     try:
         idx_rec = await neo4j_client.execute_single(
             "SHOW INDEXES YIELD name, options WHERE name = $name RETURN options AS opts",
@@ -456,6 +457,19 @@ async def test_vector_similarity_search(nm: NodeManager, neo4j_client):
     assert isinstance(results[0].get("node_id"), int)
     assert "Content" in (results[0].get("labels") or [])
 
+    # 打印查询向量与命中向量的前 10 维，及其稀疏位置（最大分量索引）
+    hit_vec = (results[0].get("node") or {}).get("text_embedding")
+    def argmax_idx(vec):
+        if not vec:
+            return None
+        mi, mv = 0, vec[0]
+        for i, v in enumerate(vec):
+            if v > mv:
+                mi, mv = i, v
+        return mi
+    print("SEARCH_VEC_FIRST10:", v1[:10], "ARGMAX_IDX:", argmax_idx(v1))
+    print("HIT_VEC_FIRST10   :", (hit_vec or [])[:10], "ARGMAX_IDX:", argmax_idx(hit_vec or []))
+
     ids = [r.get("node", {}).get("content_id") for r in results]
     assert ids[0] == a
     assert b in ids[:2]  # b 应当是次优
@@ -468,3 +482,101 @@ async def test_vector_similarity_search(nm: NodeManager, neo4j_client):
 
     # 清理
     await nm.delete_nodes("Content", "content_id", [a, b, c])
+
+
+# 向量检索基准测试：在一万个向量节点中查询最相似向量的耗时
+# 默认跳过，设置环境变量 RUN_VECTOR_BENCH=1 时才执行
+@pytest.mark.asyncio
+async def test_vector_similarity_benchmark_10k(nm: NodeManager, neo4j_client):
+    if os.getenv("RUN_VECTOR_BENCH", "0") != "1":
+        pytest.skip("Set RUN_VECTOR_BENCH=1 to run this performance benchmark")
+
+    # 1) 能力检查：需要向量检索过程存在
+    rec = await neo4j_client.execute_single(
+        "SHOW PROCEDURES YIELD name WHERE name = 'db.index.vector.queryNodes' RETURN count(*) AS cnt",
+        readonly=True,
+    )
+    if not rec or int(rec.get("cnt") or 0) == 0:
+        pytest.skip("Neo4j does not support db.index.vector.queryNodes on this server")
+
+    # 2) 等待索引 ONLINE
+    try:
+        await neo4j_client.execute("CALL db.awaitIndexes(300)")
+    except Exception:
+        pass
+
+    # 3) 读取向量维度（Content.text_embedding）
+    dim = 1024
+    try:
+        idx_rec = await neo4j_client.execute_single(
+            "SHOW INDEXES YIELD name, options WHERE name = $name RETURN options AS opts",
+            {"name": "vec_content_text_embedding"},
+            readonly=True,
+        )
+        if idx_rec and isinstance(idx_rec.get("opts"), dict):
+            opts = idx_rec["opts"] or {}
+            cfg = opts.get("indexConfig") or opts
+            maybe_dim = cfg.get("vector.dimensions")
+            if isinstance(maybe_dim, int) and maybe_dim > 0:
+                dim = maybe_dim
+    except Exception:
+        pass
+
+    # 清理历史基准数据
+    await neo4j_client.execute(
+        "MATCH (n:`Content`) WHERE n.`content_id` STARTS WITH $p DETACH DELETE n",
+        {"p": "bench_"},
+    )
+
+    # 4) 构造一万个节点（分批创建，向量为简单位热编码，索引为 i % dim）
+    N = 10000
+    batch_size = 200
+    create_cypher = """
+    UNWIND $ids AS i
+    CREATE (n:`Content` {`content_id`: 'bench_' + toString(i)})
+    SET n.`text_embedding` = [k IN range(0, $dim-1) | CASE WHEN k = (i % $dim) THEN 1.0 ELSE 0.0 END]
+    RETURN count(*) AS c
+    """
+    for start in range(1, N + 1, batch_size):
+        ids = list(range(start, min(start + batch_size, N + 1)))
+        await neo4j_client.execute_single(create_cypher, {"ids": ids, "dim": dim}, readonly=False)
+
+    # 5) 查询向量：选择与某批创建相同的模式（命中 1-hot 的同一索引）
+    q = [0.0] * dim
+    q_index = (N // 2) % dim
+    q[q_index] = 1.0
+
+    # 预热（不计时，适度放大索引候选以提高召回）
+    await nm.vector_search("Content", "text_embedding", q, top_k=1, include_score=True, index_top_k=4)
+
+    # 6) 基准计时：重复若干次，记录最小/平均用时
+    runs = 5
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        res = await nm.vector_search("Content", "text_embedding", q, top_k=1, include_score=True, index_top_k=4)
+        dt = time.perf_counter() - t0
+        assert res and res[0]["node"]["content_id"].startswith("bench_")
+        # 打印查询向量与命中向量的前 10 维与主分量索引（仅首轮打印以减少输出噪音）
+        if not times:
+            hit_vec = (res[0].get("node") or {}).get("text_embedding") or []
+            def argmax_idx(vec):
+                if not vec:
+                    return None
+                mi, mv = 0, vec[0]
+                for i, v in enumerate(vec):
+                    if v > mv:
+                        mi, mv = i, v
+                return mi
+            print("QUERY_VEC_FIRST10:", q[:10], "ARGMAX_IDX:", argmax_idx(q))
+            print("HIT_VEC_FIRST10  :", hit_vec[:10], "ARGMAX_IDX:", argmax_idx(hit_vec))
+        times.append(dt)
+    avg_ms = sum(times) / len(times) * 1000.0
+    min_ms = min(times) * 1000.0
+    print(f"[Vector-Bench] N={N}, dim={dim}, runs={runs}, avg={avg_ms:.2f}ms, min={min_ms:.2f}ms")
+
+    # 7) 清理
+    await neo4j_client.execute(
+        "MATCH (n:`Content`) WHERE n.`content_id` STARTS WITH $p DETACH DELETE n",
+        {"p": "bench_"},
+    )

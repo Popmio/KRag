@@ -1444,6 +1444,7 @@ class NodeManager:
         filters: Optional[Dict[str, Any]] = None,
         include_score: bool = True,
         score_threshold: Optional[float] = None,
+        index_top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         向量相似检索（KNN on VECTOR INDEX）。
@@ -1453,6 +1454,7 @@ class NodeManager:
             vector_property: 向量属性名称（与索引一致）。
             query_vector: 查询向量（长度需与索引维度一致）。
             top_k: 返回的相似结果数量上限。
+            index_top_k: 底层索引检索候选数（默认为 top_k）。可适度放大以提高召回率，再在应用侧截断为 top_k。
             filters: 额外的属性过滤（可选，等值过滤）。
             include_score: 结果中是否包含相似度分数 `score`。
             score_threshold: 相似度下限（仅当相似度为“值越大越相似”的度量如 cosine/dot 时语义一致；若为距离度量如 euclidean，该阈值不适用）。
@@ -1483,7 +1485,8 @@ class NodeManager:
 
         # 构造等值过滤（静态属性键，参数值）
         where_clauses: List[str] = []
-        params: Dict[str, Any] = {"index": index_name, "k": int(top_k), "vec": [float(x) for x in query_vector]}
+        k_index = int(index_top_k) if isinstance(index_top_k, int) and index_top_k > 0 else int(top_k)
+        params: Dict[str, Any] = {"index": index_name, "k": k_index, "vec": [float(x) for x in query_vector]}
         if filters:
             for idx, (k, v) in enumerate(filters.items()):
                 if not isinstance(k, str):
@@ -1520,5 +1523,8 @@ class NodeManager:
             if include_score:
                 item["score"] = r.get("score")
             results.append(item)
+        # 应用侧再截断为 top_k，提升召回（oversampling）后仍限制返回量
+        if isinstance(top_k, int) and top_k > 0 and len(results) > top_k:
+            results = results[: top_k]
         return results
 
