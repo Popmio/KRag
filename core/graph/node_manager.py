@@ -816,16 +816,21 @@ class NodeManager:
         合并单条关系（端点唯一）。
 
         Args:
-            from_label/from_key/from_value: 源端（唯一）。
-            rel_type: 关系类型。
-            to_label/to_key/to_value: 目标端（唯一）。
-            properties: 关系属性。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        from_value: 源端节点的唯一定位属性值。
+        rel_type: 关系类型。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        to_value: 目标端节点的唯一定位属性值。
+        properties: 关系属性字典（可选）。
 
         Returns:
             {"rel": 类型, "rprops": 属性}；若端点不存在，返回 None（静默跳过）。
 
         Raises:
-            ValueError/DataValidationError: 标识符或属性校验失败。
+        ValueError/DataValidationError: 标识符或属性校验失败。
+        KRagError: `from_label.from_key` 或 `to_label.to_key` 未满足唯一性要求。
         Notes:
             - 不创建端点节点，仅在两端都存在时进行 MERGE。
         """
@@ -864,17 +869,19 @@ class NodeManager:
         批量合并关系（端点唯一且必须存在）。
 
         Args:
-            from_label/from_key: 源端（唯一）。
-            rel_type: 关系类型。
-            to_label/to_key: 目标端（唯一）。
-            pairs: 列表，每项 {from_value, to_value, properties}。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        rel_type: 关系类型。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        pairs: 批量数据列表；每项包含 {from_value, to_value, properties}。
 
         Returns:
             upsert 的关系数量。
 
         Raises:
-            DataValidationError: 属性校验失败。
-            KRagError: 数据库未返回计数。
+        DataValidationError: 属性校验失败。
+        KRagError: 唯一性要求不满足或数据库未返回计数。
         """
         validate_identifier(from_label)
         validate_identifier(from_key)
@@ -917,10 +924,12 @@ class NodeManager:
         按属性批量合并关系（非唯一）。
 
         Args:
-            from_label/from_key: 源端匹配键（可非唯一）。
-            rel_type: 关系类型。
-            to_label/to_key: 目标端匹配键（可非唯一）。
-            pairs: 列表，每项 {from_value, to_value, properties}。
+        from_label: 源端节点的标签（可非唯一）。
+        from_key: 源端节点用于匹配的属性名（可非唯一）。
+        rel_type: 关系类型。
+        to_label: 目标端节点的标签（可非唯一）。
+        to_key: 目标端节点用于匹配的属性名（可非唯一）。
+        pairs: 批量数据列表；每项包含 {from_value, to_value, properties}。
 
         Returns:
             upsert 的关系数量。
@@ -973,17 +982,21 @@ class NodeManager:
         删除单条关系（端点唯一）。
 
         Args:
-            from_label/from_key/from_value: 源端（唯一）。
-            rel_type: 关系类型。
-            to_label/to_key/to_value: 目标端（唯一）。
-            rel_props: 关系属性过滤（全部匹配时删除）。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        from_value: 源端节点的唯一定位属性值。
+        rel_type: 关系类型。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        to_value: 目标端节点的唯一定位属性值。
+        rel_props: 关系属性过滤字典（全部条件匹配时删除）。
 
         Returns:
             实际删除的数量（0/1+）。
 
         Raises:
-            DataValidationError: 属性键非字符串。
-            KRagError: 数据库未返回计数。
+        DataValidationError: 属性键非字符串。
+        KRagError: 唯一性要求不满足或数据库未返回计数。
         """
         validate_identifier(from_label)
         validate_identifier(from_key)
@@ -1035,19 +1048,21 @@ class NodeManager:
         批量删除关系（端点唯一）。
 
         Args:
-            from_label/from_key: 源端（唯一）。
-            rel_type: 默认关系类型；当 rel_types 为空时使用。
-            to_label/to_key: 目标端（唯一）。
-            pairs: 每项 {from_value, to_value}。
-            rel_types: 多关系类型列表。
-            rel_props: 关系属性过滤。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        rel_type: 默认关系类型；当 `rel_types` 为空时使用该类型。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        pairs: 批量数据列表；每项包含 {from_value, to_value}。
+        rel_types: 多关系类型列表；若提供，则覆盖 `rel_type`。
+        rel_props: 关系属性过滤字典。
 
         Returns:
             删除的关系数量。
 
         Raises:
-            DataValidationError: rel_types 为空或属性键非字符串。
-            KRagError: 数据库未返回计数。
+        DataValidationError: rel_types 为空或属性键非字符串。
+        KRagError: 唯一性要求不满足或数据库未返回计数。
         """
         validate_identifier(from_label)
         validate_identifier(from_key)
@@ -1113,12 +1128,14 @@ class NodeManager:
         按属性批量删除关系（非唯一）。
 
         Args:
-            from_label/from_key: 源端匹配键（可非唯一）。
-            rel_type: 默认关系类型；当 rel_types 为空时使用。
-            to_label/to_key: 目标端匹配键（可非唯一）。
-            pairs: 每项 {from_value, to_value}。
-            rel_types: 多关系类型列表。
-            rel_props: 关系属性过滤。
+        from_label: 源端节点的标签（可非唯一）。
+        from_key: 源端节点用于匹配的属性名（可非唯一）。
+        rel_type: 默认关系类型；当 `rel_types` 为空时使用该类型。
+        to_label: 目标端节点的标签（可非唯一）。
+        to_key: 目标端节点用于匹配的属性名（可非唯一）。
+        pairs: 批量数据列表；每项包含 {from_value, to_value}。
+        rel_types: 多关系类型列表；若提供，则覆盖 `rel_type`。
+        rel_props: 关系属性过滤字典。
 
         Returns:
             删除的关系数量。
@@ -1191,15 +1208,19 @@ class NodeManager:
         删除两节点之间的所有关系（端点唯一）。
 
         Args:
-            from_label/from_key/from_value: 源端（唯一）。
-            to_label/to_key/to_value: 目标端（唯一）。
-            both_directions: 为 True 时同时删除 b->a。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        from_value: 源端节点的唯一定位属性值。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        to_value: 目标端节点的唯一定位属性值。
+        both_directions: 为 True 时同时删除反向关系（b->a）。
 
         Returns:
             删除的关系数量。
 
         Raises:
-            KRagError: 数据库未返回计数。
+        KRagError: 唯一性要求不满足或数据库未返回计数。
         """
         validate_identifier(from_label)
         validate_identifier(from_key)
@@ -1244,8 +1265,12 @@ class NodeManager:
         按属性删除“所有匹配的两端对”之间的所有关系（非唯一）。
 
         Args:
-            from_label/from_key/from_value: 源端匹配键与值（可非唯一）。
-            to_label/to_key/to_value: 目标端匹配键与值（可非唯一）。
+        from_label: 源端节点的标签（可非唯一）。
+        from_key: 源端节点用于匹配的属性名（可非唯一）。
+        from_value: 源端节点用于匹配的属性值（可非唯一）。
+        to_label: 目标端节点的标签（可非唯一）。
+        to_key: 目标端节点用于匹配的属性名（可非唯一）。
+        to_value: 目标端节点用于匹配的属性值（可非唯一）。
             both_directions: 为 True 时同时删除 b->a。
 
         Returns:
@@ -1300,16 +1325,21 @@ class NodeManager:
         获取两端点之间的关系列表（端点唯一）。
 
         Args:
-            from_label/from_key/from_value: 源端（唯一）。
-            to_label/to_key/to_value: 目标端（唯一）。
-            rel_types: 仅返回这些类型；None 表示不限。
-            include_rel_props: 是否包含关系属性。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        from_value: 源端节点的唯一定位属性值。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        to_value: 目标端节点的唯一定位属性值。
+        rel_types: 仅返回这些关系类型；为 None 时不限制关系类型。
+        include_rel_props: 是否在结果中包含关系属性。
 
         Returns:
             列表：每项包含 {rel, rprops, from_node, to_node}。
 
         Raises:
-            DataValidationError: rel_types 为空或类型名不合法。
+        DataValidationError: rel_types 为空或类型名不合法。
+        KRagError: `from_label.from_key` 或 `to_label.to_key` 未满足唯一性要求。
         """
         validate_identifier(from_label)
         validate_identifier(from_key)
@@ -1355,12 +1385,19 @@ class NodeManager:
         获取两端点之间的“所有类型”关系（端点唯一）的便捷封装。
 
         Args:
-            from_label/from_key/from_value: 源端（唯一）。
-            to_label/to_key/to_value: 目标端（唯一）。
-            include_rel_props: 是否包含关系属性。
+        from_label: 源端节点的标签。要求该标签上的属性 `from_key` 具备唯一约束。
+        from_key: 源端节点的唯一定位属性名。
+        from_value: 源端节点的唯一定位属性值。
+        to_label: 目标端节点的标签。要求该标签上的属性 `to_key` 具备唯一约束。
+        to_key: 目标端节点的唯一定位属性名。
+        to_value: 目标端节点的唯一定位属性值。
+        include_rel_props: 是否在结果中包含关系属性。
 
         Returns:
-            关系列表（同 get_relationships）。
+        关系列表（与 get_relationships 相同的返回结构）。
+
+    Raises:
+        KRagError: `from_label.from_key` 或 `to_label.to_key` 未满足唯一性要求。
         """
         return await self.get_relationships(
             from_label,
@@ -1463,7 +1500,7 @@ class NodeManager:
                 item["score"] = r.get("score")
             results.append(item)
         # 应用侧再截断为 top_k，提升召回（oversampling）后仍限制返回量
-        if isinstance(top_k, int) and top_k > 0 and len(results) > top_k:
+        if isinstance(top_k, int) and 0 < top_k < len(results):
             results = results[: top_k]
         return results
 
